@@ -1,0 +1,1 @@
+curl  -i -X POST http://localhost:8080/job/test/job/job_in_folder/build -u "tomas:lAKtat37," -H "Jenkins-Crumb:cb0f4f9bb7847d115e07bb15317f524b"
