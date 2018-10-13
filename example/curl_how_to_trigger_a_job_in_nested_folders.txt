@@ -1,0 +1,1 @@
+curl  -i -X POST http://localhost:8080/job/test/job/folder2/job/job_in_folder_depth_2/build
