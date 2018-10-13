@@ -176,8 +176,7 @@ public:
     std::string action;
     std::string hostname;
     std::string port;
-    std::string passwd;
-    std::string user;
+    std::string authorization;
     std::string job_name;
     std::string ev_done;
     std::string ev_fail;
@@ -195,7 +194,8 @@ public:
     {
         *reinterpret_cast<job_t*>(this) = rhs;
     }
-
+    std::string json_rep_of_params;
+    std::string json_rep_of_params_url_encoded;
     std::chrono::steady_clock::time_point fetched;
 };
 
@@ -217,7 +217,7 @@ Ism4ceps_plugin_interface* plugin_master;
 std::mutex mysql_driver_mtx;
 
 static bool read_http_reply(int sck,std::stringstream& data){
- constexpr auto buf_size = 4096;
+ constexpr auto buf_size = 32768;
  char buf[buf_size];
  auto& buffer = data;
  std::string eom = "\r\n\r\n";
@@ -245,7 +245,120 @@ static bool read_http_reply(int sck,std::stringstream& data){
  return true;
 }
 
-void check_job_thread_fn(int max_tries,
+
+static char base64set[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string encode_base64(void const * mem, size_t len){
+ unsigned char * memory = (unsigned char*)mem;
+ if (len == 0) return {};
+ int rest = len % 3;
+ size_t main_part = len - rest;
+ int out_len = (len / 3) * 4;
+ short unsigned int padding = 0;
+ if (rest == 1) {out_len += 4;padding=2;} else if (rest == 2){ out_len +=4;padding=1;}
+ std::string r;
+ r.resize(out_len);
+ size_t j = 0;
+ size_t jo = 0;
+
+ for(; j < main_part; j+=3,jo+=4){
+  r[jo] = base64set[ *(memory + j) >> 2];
+  r[jo+1] = base64set[  ( (*(memory + j) & 3) << 4)  | ( *(memory + j + 1) >> 4) ];
+  r[jo+2] = base64set[ ( (*(memory + j + 1) & 0xF) << 2 )  | (*(memory + j + 2) >> 6) ];
+  r[jo+3] = base64set[*(memory + j + 2) & 0x3F];
+ }
+ if (rest == 1){
+  r[jo] = base64set[ *(memory + j) >> 2];
+  r[jo+1] = base64set[ (*(memory + j) & 3) << 4];
+  j+=2;jo+=2;
+ } else if (rest == 2) {
+  r[jo] = base64set[ *(memory + j) >> 2];
+  r[jo+1] = base64set[  ( (*(memory + j) & 3) << 4)  | ( *(memory + j + 1) >> 4) ];
+  r[jo+2] = base64set[ (*(memory + j + 1) & 0xF) << 2 ];
+  j+=3;jo+=3;
+ }
+ if (padding == 1) r[jo]='='; else if (padding == 2) {r[jo] = '='; r[jo+1] = '=';}
+ return r;
+}
+
+static std::string encode_base64(std::string s){
+ return encode_base64((void*)s.c_str(),s.length());
+}
+
+static std::string hex_ch(int digit){
+ if ( digit == 0) return "0";
+ if ( digit == 1) return "1";
+ if ( digit == 2) return "2";
+ if ( digit == 3) return "3";
+ if ( digit == 4) return "4";
+ if ( digit == 5) return "5";
+ if ( digit == 6) return "6";
+ if ( digit == 7) return "7";
+ if ( digit == 8) return "8";
+ if ( digit == 9) return "9";
+ if ( digit == 10) return "A";
+ if ( digit == 11) return "B";
+ if ( digit == 12) return "C";
+ if ( digit == 13) return "D";
+ if ( digit == 14) return "E";
+ return "F";
+}
+
+static std::string url_encode_ascii(std::string in){
+ std::stringstream ss;
+ for(std::size_t i = 0; i != in.length(); ++i ){
+     if (std::isalnum(in[i])){
+         char buffer[2] = {0}; buffer[0] = in[i];
+         ss << buffer;
+     }else{
+         ss << "%" << (in[i] < 16 ? "0": hex_ch(in[i] / 16) )<< hex_ch(in[i]% 16);
+     }
+
+ }
+ return ss.str();
+}
+
+
+static std::string escape_json_string(std::string const & s){
+    bool transform_necessary = false;
+    for(std::size_t i = 0; i!=s.length();++i){
+        auto ch = s[i];
+        if (ch == '\n' || ch == '\t'|| ch == '\r' || ch == '"' || ch == '\\'){
+            transform_necessary = true; break;
+        }
+    }
+    if (!transform_necessary) return s;
+
+    std::stringstream ss;
+    for(std::size_t i = 0; i!=s.length();++i){
+        char buffer[2] = {0};
+        char ch = buffer[0] = s[i];
+        if (ch == '\n') ss << "\\n";
+        else if (ch == '\t') ss << "\\t";
+        else if (ch == '\r' ) ss << "\\r";
+        else if (ch == '"') ss << "\\\"";
+        else if (ch == '\\') ss << "\\\\";
+        else ss << buffer;
+    }
+    return ss.str();
+}
+
+
+std::string example = R"({"parameter": [{"name":"sapcode", "value":"123"}, {"name":"ROLLOUTNAME", "value":"high"}]})";
+
+
+
+std::string test_msg_1 = "POST /job/pos_rollout_automated_002_auto_prepare_and_start_rollout_protocol/build HTTP/1.1\r\n"
+        "Host: localhost:8080\r\n"
+        "Authorization: Basic dG9tYXM6bEFLdGF0Mzcs\r\n"
+        "User-Agent: curl/7.58.0\r\n"
+        "Accept: text\r\n"
+        "Jenkins-Crumb:cb0f4f9bb7847d115e07bb15317f524b\r\n"
+        "Content-Length: 171\r\n"
+        "Content-Type: application/x-www-form-urlencoded\r\n\r\n"
+        "json=%7B%22parameter%22%3A%20%5B%7B%22name%22%3A%22sapcode%22%2C%20%22value%22%3A%22123%22%7D%2C%20%7B%22name%22%3A%22ROLLOUTNAME%22%2C%20%22value%22%3A%22high%22%7D%5D%7D";
+
+void control_job_thread_fn(int max_tries,
                          std::chrono::milliseconds delta,
                          std::string host, std::string user,std::string credentials, worker_info_t::queue_t* q){
 
@@ -257,6 +370,31 @@ void check_job_thread_fn(int max_tries,
             for(;!q->data().empty();){
                 job_ext_t e = q->data().front();
                 e.fetched = std::chrono::steady_clock::now();
+                if(e.params.size())
+                {
+                    std::stringstream ss;
+                    ss << "{\"parameter\":[";
+                    bool first_entry = true;
+                    for(auto p: e.params){
+                        if(!first_entry) ss << ",";
+                        ss<<"{";
+                        ss<<"\"name\":\""<<escape_json_string(p.first)<<"\",";
+                        ss<<"\"value\":";
+                        if(p.second.what_ == sm4ceps_plugin_int::Variant::Int)
+                            ss<<p.second.iv_;
+                        else if(p.second.what_ == sm4ceps_plugin_int::Variant::Double)
+                            ss<<p.second.dv_;
+                        else if(p.second.what_ == sm4ceps_plugin_int::Variant::String)
+                            ss<<"\""<<escape_json_string(p.second.sv_)<<"\"";
+
+
+                        ss<<"}";
+                        first_entry = false;
+                    }
+                    ss << "]}";
+                    e.json_rep_of_params = "json="+ss.str();
+                    e.json_rep_of_params_url_encoded = "json="+url_encode_ascii(ss.str());
+                }
                 q->data().pop();
                 if (e.action.length()==0) jq.push(e);
                 else actions.push(e);
@@ -284,13 +422,46 @@ void check_job_thread_fn(int max_tries,
         }
         job_ext_t current_job;
         auto jobs_to_process = jq.size();
+
+        std::string jenkins_crumb = "cb0f4f9bb7847d115e07bb15317f524b";
+
         for(;jobs_to_process;--jobs_to_process){
             current_job = jq.front();
-            std::cout << current_job.hostname << " " << current_job.port << "\n";
             jq.pop();
 
-            std::string msg = "POST /job/"+current_job.job_name+"/api HTTP/1.1\r\nHost: "+current_job.hostname+"\r\n";
-            msg = "POST /jenkins/crumbIssuer/api/json HTTP/1.1\r\nHost: "+current_job.hostname+"\r\n";
+            std::string authorization = encode_base64(current_job.authorization.data(),current_job.authorization.length());//"dG9tYXM6bEFLdGF0Mzcs";
+
+
+            std::stringstream ss;
+
+            ss << "POST /job/" << current_job.job_name << "/build HTTP/1.1\r\n";
+            ss << "Host: "<<current_job.hostname;
+            if (current_job.port.length()) ss<<":"<<current_job.port;
+            ss<< "\r\n";
+            ss<<"User-Agent: RollAut/0.0.1\r\n";
+            ss<<"Accept: */*\r\n";
+            ss<<"Authorization: Basic "<< authorization <<"\r\n";
+            ss<<"Jenkins-Crumb:"<< jenkins_crumb <<"\r\n";
+
+            if (current_job.json_rep_of_params_url_encoded.length()){
+                ss<<"Content-Length: "<<current_job.json_rep_of_params_url_encoded.length()<<"\r\n";
+                ss<<"Content-Type: application/x-www-form-urlencoded\r\n\r\n";
+                ss<<current_job.json_rep_of_params_url_encoded;
+            } else ss<< "\r\n";
+
+            R"(POST /job/pos_rollout_automated_002_auto_prepare_and_start_rollout_protocol/build HTTP/1.1\r\n"
+                    "Host: localhost:8080\r\n"
+                    "Authorization: Basic dG9tYXM6bEFLdGF0Mzcs\r\n"
+                    "User-Agent: curl/7.58.0\r\n"
+                    "Accept: */*\r\n"
+                    "Jenkins-Crumb:cb0f4f9bb7847d115e07bb15317f524b\r\n"
+                    "Content-Length: 171\r\n"
+                    "Content-Type: application/x-www-form-urlencoded\r\n\r\n"
+                    "json=%7B%22parameter%22%3A%20%5B%7B%22name%22%3A%22sapcode%22%2C%20%22value%22%3A%22123%22%7D%2C%20%7B%22name%22%3A%22ROLLOUTNAME%22%2C%20%22value%22%3A%22high%22%7D%5D%7D"
+            )";
+
+            auto msg = ss.str();
+
 
             addrinfo hints = {0};
             addrinfo *result, *rp;
@@ -330,13 +501,14 @@ void check_job_thread_fn(int max_tries,
             freeaddrinfo(result);
 
 
+
             if(write(cfd,msg.c_str(),msg.length()) != msg.length()){
                 std::cerr<<"write() failed (msg)\n"; continue;
             }
 
-            if(write(cfd,"\r\n\r\n",4) != 4){
+            /*if(write(cfd,"\r\n\r\n",4) != 4){
                 std::cerr<<"write() failed (trailing seq)\n"; continue;
-            }
+            }*/
 
             std::stringstream reply;
             read_http_reply(cfd,reply);
@@ -385,11 +557,11 @@ static void issue_job(job_t job){
         return;
     }
 
-    auto wk = worker_info_key_t{job.hostname, job.user,issue_counter++ % max_number_of_worker_threads};
+    auto wk = worker_info_key_t{job.hostname, "",issue_counter++ % max_number_of_worker_threads};
     auto it = workers.find(wk);
     if (it == workers.end()){
         auto q = new worker_info_t::queue_t;
-        workers[wk] = worker_info_t{new std::thread{check_job_thread_fn,10,std::chrono::milliseconds{10},job.hostname,job.user,job.passwd,q}, q};
+        workers[wk] = worker_info_t{new std::thread{control_job_thread_fn,10,std::chrono::milliseconds{10},job.hostname,"","",q}, q};
         it = workers.find(wk);
     }
     it->second.job_queue->push(job);
@@ -452,10 +624,9 @@ static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params
                         job.hostname = value(as_string_ref(r_));
                     else if (lhs_name == "port" && r_->kind() == Ast_node_kind::string_literal)
                         job.port = value(as_string_ref(r_));
-                    else if (lhs_name == "user" && r_->kind() == Ast_node_kind::string_literal)
-                        job.user = value(as_string_ref(r_));
-                    else if (lhs_name == "passwd" && r_->kind() == Ast_node_kind::string_literal)
-                        job.passwd = value(as_string_ref(r_));
+                    else if (lhs_name == "authorization" && r_->kind() == Ast_node_kind::string_literal){
+                        job.authorization = value(as_string_ref(r_));
+                    }
                     else if (lhs_name == "job_name" && r_->kind() == Ast_node_kind::string_literal)
                         job.job_name = value(as_string_ref(r_));
                     else if (lhs_name == "timeout_ms" && r_->kind() == Ast_node_kind::int_literal)

@@ -1,0 +1,1 @@
+curl  -i -X POST http://localhost:8080/job/pos_rollout_automated_002_auto_prepare_and_start_rollout_protocol/build -u "tomas:lAKtat37," -H "Jenkins-Crumb:cb0f4f9bb7847d115e07bb15317f524b" --data-urlencode json='{"parameter": [{"name":"sapcode", "value":"123"}, {"name":"ROLLOUTNAME", "value":"high"}]}'
