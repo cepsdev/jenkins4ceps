@@ -216,36 +216,6 @@ static std::map< worker_info_key_t , worker_info_t > workers;
 Ism4ceps_plugin_interface* plugin_master;
 std::mutex mysql_driver_mtx;
 
-static bool read_http_reply(int sck,std::stringstream& data){
- constexpr auto buf_size = 32768;
- char buf[buf_size];
- auto& buffer = data;
- std::string eom = "\r\n\r\n";
- std::size_t eom_pos = 0;
-
- bool req_complete = false;
- ssize_t readbytes = 0;
- ssize_t buf_pos = 0;
-
- for(; (readbytes=recv(sck,buf,buf_size-1,0)) > 0;){
-  buf[readbytes] = 0;
-  std::cerr << buf;
-  for(buf_pos = 0; buf_pos < readbytes; ++buf_pos){
-   if (buf[buf_pos] == eom[eom_pos])++eom_pos;else eom_pos = 0;
-   if (eom_pos == eom.length()){
-    req_complete = true;
-    if (buf_pos+1 < readbytes) buffer << buf+buf_pos+1;
-    break;
-   }
-  }
-  buffer << buf;
-  if(req_complete) break;
- }
-
- return true;
-}
-
-
 static char base64set[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 static std::string encode_base64(void const * mem, size_t len){
@@ -344,6 +314,128 @@ static std::string escape_json_string(std::string const & s){
 }
 
 
+
+
+
+static std::pair<bool,std::string> get_virtual_can_attribute_content(std::string attr, std::vector<std::pair<std::string,std::string>> const & http_header){
+ for(auto const & v : http_header){
+     if (v.first == attr)
+         return {true,v.second};
+ }
+ return {false,{}};
+}
+
+class http_reply_t {
+  public:
+    int MAX_CONTENT_SIZE = 1024768;
+
+    using attribute_t = std::pair<std::string,std::string>;
+    std::string header;
+    std::vector<std::pair<std::string,std::string>> attributes;
+    int reply_code;
+    int content_length;
+    std::stringstream content;
+};
+
+static http_reply_t
+       read_http_reply(int sck){
+
+
+ http_reply_t r;
+ constexpr auto buf_size = 4096;
+ char buf[buf_size+1];
+ std::stringstream stream_buffer;
+ std::string eom = "\r\n\r\n";
+ std::size_t eom_pos = 0;
+
+ bool req_complete = false;
+ ssize_t readbytes = 0;
+ ssize_t buf_pos = 0;
+ int content_read = 0;
+
+ for(; (readbytes=recv(sck,buf,buf_size,0)) > 0;){
+  buf[readbytes] = 0;
+  for(buf_pos = 0; buf_pos < readbytes; ++buf_pos){
+   if (buf[buf_pos] == eom[eom_pos])++eom_pos;else eom_pos = 0;
+   if (eom_pos == eom.length()){
+    req_complete = true;
+    if ( buf_pos+1 < readbytes){
+        r.content << buf+(buf_pos+1);
+        content_read = readbytes - buf_pos;
+    }
+    buf[buf_pos+1] = 0;
+    break;
+   }
+  }
+  stream_buffer << buf;
+
+  if(req_complete) break;
+ }
+
+ auto buffer = stream_buffer.str();
+ int content_length{};
+
+ if (req_complete) {
+  std::string first_line;
+  size_t line_start = 0;
+  for(size_t i = 0; i < buffer.length();++i){
+    if (i+1 < buffer.length() && buffer[i] == '\r' && buffer[i+1] == '\n' ){
+        if (line_start == 0) first_line = buffer.substr(line_start,i);
+        else if (line_start != i){
+         std::string attribute;
+         std::string content;
+         std::size_t j = line_start;
+         for(;j < i && buffer[j]==' ';++j);
+         auto attr_start = j;
+         for(;j < i && buffer[j]!=':';++j);
+         attribute = buffer.substr(attr_start,j-attr_start);
+         ++j; //INVARIANT: buffer[j] == ':' || j == i
+         for(;j < i && buffer[j]==' ' ;++j);
+         auto cont_start = j;
+         auto cont_end = i - 1;
+         for(;buffer[cont_end] == ' ';--cont_end);
+         if ( cont_start <= cont_end) content = buffer.substr(cont_start, cont_end - cont_start + 1);
+         r.attributes.push_back(std::make_pair(attribute,content));
+         if (attribute == "Content-Length")
+             content_length = std::atoi(content.c_str());
+        }
+        line_start = i + 2;++i;
+    }
+  }
+  r.header = first_line;
+ }
+ if (content_length-content_read > 0){
+     auto bytes_left = std::min(r.MAX_CONTENT_SIZE,content_length-content_read);
+     for(; bytes_left ; bytes_left-=readbytes){
+      readbytes=recv(sck,buf,std::min(bytes_left,buf_size),0);
+      buf[readbytes] = 0;
+      r.content << buf;
+     }
+ }
+ r.content_length = content_length;
+ r.reply_code = -1; //Unknown
+ //Get Reply Code
+ {
+     auto start_rcode = r.header.find_first_of(" ");
+     if (start_rcode != std::string::npos) for(;start_rcode < r.header.length() && r.header[start_rcode] == ' ';++start_rcode);
+
+     if (start_rcode != std::string::npos && start_rcode < r.header.length()){
+         auto end_rcode = r.header.find_first_of(" ",start_rcode);
+         if (end_rcode != std::string::npos) r.reply_code = std::stoi(r.header.substr(start_rcode,end_rcode - start_rcode));
+     }
+ }
+ return r;
+}
+
+
+
+
+
+
+
+
+
+
 std::string example = R"({"parameter": [{"name":"sapcode", "value":"123"}, {"name":"ROLLOUTNAME", "value":"high"}]})";
 
 
@@ -401,13 +493,13 @@ void control_job_thread_fn(int max_tries,
             }
     };
 
+    std::map< std::pair<std::string,std::string>,std::string> jenkins_server2_crumb;
     for(;;){
         fetch_new_jobs();
         if(jq.empty()) {
             q->wait_for_data();
             continue;
         }
-
         for(;actions.size();){
             auto a = actions.front();
             actions.pop();
@@ -423,17 +515,73 @@ void control_job_thread_fn(int max_tries,
         job_ext_t current_job;
         auto jobs_to_process = jq.size();
 
-        std::string jenkins_crumb = "cb0f4f9bb7847d115e07bb15317f524b";
+
+
 
         for(;jobs_to_process;--jobs_to_process){
             current_job = jq.front();
-            jq.pop();
 
+            std::string jenkins_crumb = jenkins_server2_crumb[std::make_pair(current_job.hostname,current_job.port)];//"cb0f4f9bb7847d115e07bb15317f524b";
             std::string authorization = encode_base64(current_job.authorization.data(),current_job.authorization.length());//"dG9tYXM6bEFLdGF0Mzcs";
+            if (jenkins_crumb.length() == 0){
+                std::stringstream ss;
+                ss << "GET /crumbIssuer/api/xml?xpath=concat(//crumbRequestField,%22:%22,//crumb) HTTP/1.1\r\n";
+                ss << "Host: "<<current_job.hostname;
+                if (current_job.port.length()) ss<<":"<<current_job.port;
+                ss<< "\r\n";
+                ss<<"User-Agent: RollAut/0.0.1\r\n";
+                ss<<"Accept: */*\r\n";
+                ss<<"Authorization: Basic "<< authorization <<"\r\n";
+                ss<< "\r\n";
+                auto msg = ss.str();
+                addrinfo hints = {0};
+                addrinfo *result, *rp;
+                hints.ai_canonname =nullptr;
+                hints.ai_addr = nullptr;
+                hints.ai_next = nullptr;
+                hints.ai_family = AF_UNSPEC;
+                hints.ai_socktype = SOCK_STREAM;
+                hints.ai_flags = AI_NUMERICSERV;
 
+                if (getaddrinfo(current_job.hostname.c_str(),
+                                current_job.port.c_str(),
+                                &hints,
+                                &result) != 0)
+                {
+                    std::cerr<<"getaddrinfo() failed\n"<<std::endl; continue;
+                }
 
+                int cfd = -1;
+                for(rp = result; rp != nullptr; rp = rp->ai_next){
+                    cfd = socket(rp->ai_family,rp->ai_socktype,rp->ai_protocol);
+                    if(cfd==-1)
+                        continue;
+                    if(connect(cfd,rp->ai_addr,rp->ai_addrlen) != -1)
+                        break;
+                    close(cfd);
+                }
+
+                if(rp == nullptr)
+                {
+                    freeaddrinfo(result);
+                    std::cerr<<"connect() failed\n"; continue;
+                }
+                freeaddrinfo(result);
+                if(write(cfd,msg.c_str(),msg.length()) != msg.length()){
+                    std::cerr<<"write() failed (msg)\n"; continue;
+                }
+                auto http_reply = read_http_reply(cfd);
+                if ( http_reply.reply_code / 100  == 2 && http_reply.content_length){
+                    auto s = http_reply.content.str();
+                    auto n = s.length();
+                    auto sp = http_reply.content.str().find_last_of(":");
+                    if (sp == std::string::npos) continue;
+                    auto t = http_reply.content.str().substr(sp+1,n-sp-1);
+                    jenkins_server2_crumb[std::make_pair(current_job.hostname,current_job.port)] = t;
+                }
+                continue;
+            }
             std::stringstream ss;
-
             ss << "POST /job/" << current_job.job_name << "/build HTTP/1.1\r\n";
             ss << "Host: "<<current_job.hostname;
             if (current_job.port.length()) ss<<":"<<current_job.port;
@@ -449,24 +597,12 @@ void control_job_thread_fn(int max_tries,
                 ss<<current_job.json_rep_of_params_url_encoded;
             } else ss<< "\r\n";
 
-            R"(POST /job/pos_rollout_automated_002_auto_prepare_and_start_rollout_protocol/build HTTP/1.1\r\n"
-                    "Host: localhost:8080\r\n"
-                    "Authorization: Basic dG9tYXM6bEFLdGF0Mzcs\r\n"
-                    "User-Agent: curl/7.58.0\r\n"
-                    "Accept: */*\r\n"
-                    "Jenkins-Crumb:cb0f4f9bb7847d115e07bb15317f524b\r\n"
-                    "Content-Length: 171\r\n"
-                    "Content-Type: application/x-www-form-urlencoded\r\n\r\n"
-                    "json=%7B%22parameter%22%3A%20%5B%7B%22name%22%3A%22sapcode%22%2C%20%22value%22%3A%22123%22%7D%2C%20%7B%22name%22%3A%22ROLLOUTNAME%22%2C%20%22value%22%3A%22high%22%7D%5D%7D"
-            )";
-
             auto msg = ss.str();
 
 
             addrinfo hints = {0};
             addrinfo *result, *rp;
 
-            //memset(&hints,0,sizeof(addrinfo));
             hints.ai_canonname =nullptr;
             hints.ai_addr = nullptr;
             hints.ai_next = nullptr;
@@ -500,38 +636,15 @@ void control_job_thread_fn(int max_tries,
 
             freeaddrinfo(result);
 
-
-
             if(write(cfd,msg.c_str(),msg.length()) != msg.length()){
                 std::cerr<<"write() failed (msg)\n"; continue;
             }
-
-            /*if(write(cfd,"\r\n\r\n",4) != 4){
-                std::cerr<<"write() failed (trailing seq)\n"; continue;
-            }*/
-
-            std::stringstream reply;
-            read_http_reply(cfd,reply);
-
-                if (false) {
-                    if (current_job.timeout.count()!=0){
-                        if (std::chrono::duration_cast<std::chrono::milliseconds> (std::chrono::steady_clock::now()-current_job.fetched).count() < current_job.timeout.count())
-                            jq.push(current_job);
-                        else if (current_job.ev_timeout.length())
-                            plugin_master->queue_event(current_job.ev_timeout,{sm4ceps_plugin_int::Variant{"Reason:Timeout"},
-                                                                               sm4ceps_plugin_int::Variant{current_job.job_name},
-                                                                               sm4ceps_plugin_int::Variant{current_job.id}
-                                                       });
-                        else
-                            plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{"Reason:Timeout"},
-                                                                            sm4ceps_plugin_int::Variant{current_job.job_name},
-                                                                            sm4ceps_plugin_int::Variant{current_job.id}});
-                    } else jq.push(current_job);
-                } else {
-                    auto r = 0;
-                    plugin_master->queue_event(current_job.ev_done,{sm4ceps_plugin_int::Variant{(int)r}});
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(150 + rand() % 100));
+            auto http_reply = read_http_reply(cfd);
+            if (http_reply.reply_code / 100 == 2){
+                plugin_master->queue_event(current_job.ev_done,{sm4ceps_plugin_int::Variant{current_job.job_name}});
+                jq.pop();
+            }
+            //std::this_thread::sleep_for(std::chrono::milliseconds(150 + rand() % 100));
         }
     }
 
@@ -595,8 +708,8 @@ static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params
     //std::cout << std::endl;
 
     job_t job;
-    job.ev_fail = "event_mms_rollaut_db_check_failed";
-    job.ev_done = "event_mms_rollaut_db_check_done";
+    job.ev_fail = "event_jenkins_plugin_failed";
+    job.ev_done = "event_jenkins_plugin_done";
     job.command = "build";
 
     for(auto p: args){
@@ -606,7 +719,6 @@ static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params
             if (l_->kind() == Ast_node_kind::symbol){
                 auto & l = as_symbol_ref(l_);
                 if (kind(l) != "Formal_parameter_name" && kind(l) != "Parameter") continue;
-                //std::cout << name(l) << std::endl;
                 auto const & lhs_name = name(l);
 
                 if (r_->kind() == Ast_node_kind::symbol)
