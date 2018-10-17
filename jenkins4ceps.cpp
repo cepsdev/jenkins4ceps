@@ -428,27 +428,76 @@ static http_reply_t
 }
 
 
+class http_request_and_reply{
+public:
+    int sck = -1;
+    std::string hostname = "localhost";
+    std::string port = "80";
+    http_reply_t http_reply;
+    enum Resultcode {
+        UNDEFINED,
+        OK,
+        ERR_CONNECT,
+        ERR_WRITE,
+        ERR_READ
+        };
+    Resultcode last_result = UNDEFINED;
+    static std::string result_str(Resultcode r){
+        if (r == OK) return "Ok";
+        else if (r == ERR_CONNECT) return "Connect failed";
+        else if (r == ERR_WRITE) return "write() failed";
+        else if (r == ERR_WRITE) return "read() failed";
+        return "Unknown";
+    }
+    Resultcode start(std::string const & msg);
+    http_request_and_reply() = default;
+    http_request_and_reply(std::string h, std::string p):hostname{h},port{p} {}
+    http_request_and_reply(std::string h, std::string p,std::string const & msg):hostname{h},port{p} {
+        start(msg);
+    }
+    ~http_request_and_reply(){
+        if(sck != -1) close(sck);sck = -1;
+    }
+};
+
+http_request_and_reply::Resultcode http_request_and_reply::start(std::string const & msg){
+    addrinfo hints = {0};
+    addrinfo *result, *rp;
+    hints.ai_canonname =nullptr;
+    hints.ai_addr = nullptr;
+    hints.ai_next = nullptr;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICSERV;
 
 
+    if (getaddrinfo(hostname.c_str(),
+                    port.c_str(),
+                    &hints,
+                    &result) != 0)
+     return last_result = Resultcode::ERR_CONNECT;
 
+    for(rp = result; rp != nullptr; rp = rp->ai_next){
+        sck = socket(rp->ai_family,rp->ai_socktype,rp->ai_protocol);
+        if(sck==-1)
+            continue;
+        if(connect(sck,rp->ai_addr,rp->ai_addrlen) != -1)
+            break;
+        close(sck);
+    }
 
-
-
-
-
-std::string example = R"({"parameter": [{"name":"sapcode", "value":"123"}, {"name":"ROLLOUTNAME", "value":"high"}]})";
-
-
-
-std::string test_msg_1 = "POST /job/pos_rollout_automated_002_auto_prepare_and_start_rollout_protocol/build HTTP/1.1\r\n"
-        "Host: localhost:8080\r\n"
-        "Authorization: Basic dG9tYXM6bEFLdGF0Mzcs\r\n"
-        "User-Agent: curl/7.58.0\r\n"
-        "Accept: text\r\n"
-        "Jenkins-Crumb:cb0f4f9bb7847d115e07bb15317f524b\r\n"
-        "Content-Length: 171\r\n"
-        "Content-Type: application/x-www-form-urlencoded\r\n\r\n"
-        "json=%7B%22parameter%22%3A%20%5B%7B%22name%22%3A%22sapcode%22%2C%20%22value%22%3A%22123%22%7D%2C%20%7B%22name%22%3A%22ROLLOUTNAME%22%2C%20%22value%22%3A%22high%22%7D%5D%7D";
+    if(rp == nullptr)
+    {
+        freeaddrinfo(result);
+        return last_result = Resultcode::ERR_CONNECT;
+    }
+    freeaddrinfo(result);
+    if(write(sck,msg.c_str(),msg.length()) != msg.length()){
+        return last_result = Resultcode::ERR_WRITE;
+    }
+    http_reply = read_http_reply(sck);
+    return last_result = Resultcode::OK;
+}
 
 void control_job_thread_fn(int max_tries,
                          std::chrono::milliseconds delta,
@@ -515,9 +564,6 @@ void control_job_thread_fn(int max_tries,
         job_ext_t current_job;
         auto jobs_to_process = jq.size();
 
-
-
-
         for(;jobs_to_process;--jobs_to_process){
             current_job = jq.front();
 
@@ -533,54 +579,30 @@ void control_job_thread_fn(int max_tries,
                 ss<<"Accept: */*\r\n";
                 ss<<"Authorization: Basic "<< authorization <<"\r\n";
                 ss<< "\r\n";
-                auto msg = ss.str();
-                addrinfo hints = {0};
-                addrinfo *result, *rp;
-                hints.ai_canonname =nullptr;
-                hints.ai_addr = nullptr;
-                hints.ai_next = nullptr;
-                hints.ai_family = AF_UNSPEC;
-                hints.ai_socktype = SOCK_STREAM;
-                hints.ai_flags = AI_NUMERICSERV;
+                http_request_and_reply read_crumb{current_job.hostname,current_job.port,ss.str()};
+                if (read_crumb.last_result != http_request_and_reply::Resultcode::OK){
+                    jq.pop();
+                    plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
+                                                                    sm4ceps_plugin_int::Variant{"Fetching Jenkins Crumb Failed ("+http_request_and_reply::result_str(read_crumb.last_result)+")"}});
+                    continue;
 
-                if (getaddrinfo(current_job.hostname.c_str(),
-                                current_job.port.c_str(),
-                                &hints,
-                                &result) != 0)
-                {
-                    std::cerr<<"getaddrinfo() failed\n"<<std::endl; continue;
                 }
 
-                int cfd = -1;
-                for(rp = result; rp != nullptr; rp = rp->ai_next){
-                    cfd = socket(rp->ai_family,rp->ai_socktype,rp->ai_protocol);
-                    if(cfd==-1)
-                        continue;
-                    if(connect(cfd,rp->ai_addr,rp->ai_addrlen) != -1)
-                        break;
-                    close(cfd);
-                }
-
-                if(rp == nullptr)
-                {
-                    freeaddrinfo(result);
-                    std::cerr<<"connect() failed\n"; continue;
-                }
-                freeaddrinfo(result);
-                if(write(cfd,msg.c_str(),msg.length()) != msg.length()){
-                    std::cerr<<"write() failed (msg)\n"; continue;
-                }
-                auto http_reply = read_http_reply(cfd);
-                if ( http_reply.reply_code / 100  == 2 && http_reply.content_length){
-                    auto s = http_reply.content.str();
+                if ( read_crumb.http_reply.reply_code / 100  == 2 && read_crumb.http_reply.content_length){
+                    auto s = read_crumb.http_reply.content.str();
                     auto n = s.length();
-                    auto sp = http_reply.content.str().find_last_of(":");
+                    auto sp = read_crumb.http_reply.content.str().find_last_of(":");
                     if (sp == std::string::npos) continue;
-                    auto t = http_reply.content.str().substr(sp+1,n-sp-1);
+                    auto t = read_crumb.http_reply.content.str().substr(sp+1,n-sp-1);
                     jenkins_server2_crumb[std::make_pair(current_job.hostname,current_job.port)] = t;
+                } else {
+                    jq.pop();
+                    plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
+                                                                    sm4ceps_plugin_int::Variant{"Fetching Jenkins Crumb Failed ("+read_crumb.http_reply.header+")"}});
                 }
                 continue;
             }
+            jq.pop();
             std::stringstream ss;
             ss << "POST /job/" << current_job.job_name << "/build HTTP/1.1\r\n";
             ss << "Host: "<<current_job.hostname;
@@ -642,7 +664,6 @@ void control_job_thread_fn(int max_tries,
             auto http_reply = read_http_reply(cfd);
             if (http_reply.reply_code / 100 == 2){
                 plugin_master->queue_event(current_job.ev_done,{sm4ceps_plugin_int::Variant{current_job.job_name}});
-                jq.pop();
             }
             //std::this_thread::sleep_for(std::chrono::milliseconds(150 + rand() % 100));
         }
