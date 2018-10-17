@@ -722,6 +722,15 @@ static void flatten_args(ceps::ast::Nodebase_ptr r, std::vector<ceps::ast::Nodeb
 
 
 static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params){
+    auto trim = [=](std::string & s) {
+        if (s.length() == 0) return;
+        auto a = 0;
+        for(;a < s.length() && s[a] == ' ';++a);
+        if (a == s.length()) {s="";return;}
+        auto b = s.length()-1;
+        for(;b > a && s[b] == ' ' ;--b);
+        if (a != 0 || b != s.length()-1) s = s.substr(a,b-a+1);
+    };
     using namespace ceps::ast;
     std::vector<ceps::ast::Nodebase_ptr> args;
     if (params != nullptr && params->children().size()) flatten_args(params->children()[0], args, ',');
@@ -757,6 +766,32 @@ static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params
                         job.hostname = value(as_string_ref(r_));
                     else if (lhs_name == "port" && r_->kind() == Ast_node_kind::string_literal)
                         job.port = value(as_string_ref(r_));
+                    else if (lhs_name == "url" && r_->kind() == Ast_node_kind::string_literal){
+                        std::string url = value(as_string_ref(r_));
+                        {
+                           auto p = url.find("http://");
+                           if (p != std::string::npos)
+                               url = url.substr(p+7);
+                        }
+                        auto host = url;
+                        std::string port = "80";
+                        {
+                            auto p = host.find_first_of(":");
+                            if (p != std::string::npos){
+                                auto start_port = p+1;
+                                for(;start_port < host.length() && host[start_port] == ' ';++start_port);
+                                auto end_port = start_port;
+                                for(;end_port < host.length() && std::isdigit(host[end_port]);++end_port);
+                                --end_port;
+                                if(start_port <= end_port && host.length() > end_port)
+                                    port = host.substr(start_port,end_port-start_port+1);
+                                host = host.substr(0,p);
+                            }
+                        }
+                        trim(host);
+                        if(host.length()) job.hostname = host;
+                        if(port.length()) job.port = port;
+                    }
                     else if (lhs_name == "authorization" && r_->kind() == Ast_node_kind::string_literal){
                         job.authorization = value(as_string_ref(r_));
                     }
