@@ -10,6 +10,7 @@ INCLUDEPATH += $$_PRO_FILE_PWD_/../..
 INCLUDEPATH += $$_PRO_FILE_PWD_/../../ceps/core/include
 INCLUDEPATH += $$_PRO_FILE_PWD_/../../sm4ceps
 INCLUDEPATH += $$_PRO_FILE_PWD_/../../pugixml/src
+INCLUDEPATH += $$_PRO_FILE_PWD_/../../rapidjson/include
 
 QT       -= core gui
 

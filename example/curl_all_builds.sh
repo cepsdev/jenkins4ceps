@@ -1,0 +1,1 @@
+curl  -i -X GET 'http://localhost:8080/job/pos_rollout_automated_002_auto_prepare_and_start_rollout_protocol/api/json?&pretty=true&tree=allBuilds\[number,timestamp,actions\[parameters\[name,value\]\],result\]\{0,800\}' -u "tomas:lAKtat37," -H "Jenkins-Crumb:cb0f4f9bb7847d115e07bb15317f524b"

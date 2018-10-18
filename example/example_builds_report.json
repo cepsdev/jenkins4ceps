@@ -1,0 +1,10 @@
+--_curl_--http://localhost:8080/job/pos_rollout_automated_002_auto_prepare_and_start_rollout_protocol/api/json?&pretty=true&tree=allBuilds[anumber,timestamp,actions[parameters[name,value]],result]0
+HTTP/1.1 500 Server Error
+Connection: close
+Server: Jetty(9.4.z-SNAPSHOT)
+
+--_curl_--http://localhost:8080/job/pos_rollout_automated_002_auto_prepare_and_start_rollout_protocol/api/json?&pretty=true&tree=allBuilds[anumber,timestamp,actions[parameters[name,value]],result]10
+HTTP/1.1 500 Server Error
+Connection: close
+Server: Jetty(9.4.z-SNAPSHOT)
+

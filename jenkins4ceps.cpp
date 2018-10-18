@@ -22,6 +22,7 @@
 #include <sys/types.h>
 #include <netdb.h>
 #include <stdlib.h>
+#include "rapidjson/rapidjson.h"
 
 using namespace std::chrono_literals;
 
@@ -338,7 +339,7 @@ class http_reply_t {
 };
 
 static http_reply_t
-       read_http_reply(int sck){
+       read_http_reply(int sck,bool debug = false){
 
 
  http_reply_t r;
@@ -355,6 +356,9 @@ static http_reply_t
 
  for(; (readbytes=recv(sck,buf,buf_size,0)) > 0;){
   buf[readbytes] = 0;
+  if (debug){
+      std::cerr << buf;
+  }
   for(buf_pos = 0; buf_pos < readbytes; ++buf_pos){
    if (buf[buf_pos] == eom[eom_pos])++eom_pos;else eom_pos = 0;
    if (eom_pos == eom.length()){
@@ -409,6 +413,9 @@ static http_reply_t
      for(; bytes_left ; bytes_left-=readbytes){
       readbytes=recv(sck,buf,std::min(bytes_left,buf_size),0);
       buf[readbytes] = 0;
+      if (debug){
+          std::cerr << buf;
+      }
       r.content << buf;
      }
  }
@@ -434,6 +441,7 @@ public:
     std::string hostname = "localhost";
     std::string port = "80";
     http_reply_t http_reply;
+    bool debug = false;
     enum Resultcode {
         UNDEFINED,
         OK,
@@ -452,7 +460,7 @@ public:
     Resultcode start(std::string const & msg);
     http_request_and_reply() = default;
     http_request_and_reply(std::string h, std::string p):hostname{h},port{p} {}
-    http_request_and_reply(std::string h, std::string p,std::string const & msg):hostname{h},port{p} {
+    http_request_and_reply(std::string h, std::string p,std::string const & msg, bool d = false):hostname{h},port{p},debug{d} {
         start(msg);
     }
     ~http_request_and_reply(){
@@ -492,12 +500,22 @@ http_request_and_reply::Resultcode http_request_and_reply::start(std::string con
         return last_result = Resultcode::ERR_CONNECT;
     }
     freeaddrinfo(result);
+    if (debug){
+        std::cerr << ">>"<<hostname<<":"<<port<<std::endl;
+        std::cerr << msg << std::endl<<std::endl;
+    }
     if(write(sck,msg.c_str(),msg.length()) != msg.length()){
         return last_result = Resultcode::ERR_WRITE;
     }
-    http_reply = read_http_reply(sck);
+    http_reply = read_http_reply(sck,debug);
     return last_result = Resultcode::OK;
 }
+
+
+
+//Jenkins Monitoring: Builds
+
+
 
 void control_job_thread_fn(int max_tries,
                          std::chrono::milliseconds delta,
@@ -603,6 +621,30 @@ void control_job_thread_fn(int max_tries,
                 continue;
             }
             jq.pop();
+
+#if 1
+            //pos_rollout_automated_002_auto_prepare_and_start_rollout_protocol/api/json?&pretty=true&tree=allBuilds[number,timestamp,actions[parameters[name,value]],result]{0,800}
+            {
+                std::stringstream ss;
+                ss << "GET /job/" << current_job.job_name << "/api/json?&pretty=true&tree=allBuilds[number,timestamp,actions[parameters[name,value]],result]{0,800} HTTP/1.1\r\n";
+                ss << "Host: "<<current_job.hostname;
+                if (current_job.port.length()) ss<<":"<<current_job.port;
+                ss<< "\r\n";
+                ss<<"User-Agent: RollAut/0.0.1\r\n";
+                ss<<"Accept: */*\r\n";
+                ss<<"Authorization: Basic "<< authorization <<"\r\n";
+                ss<<"Jenkins-Crumb:"<< jenkins_crumb <<"\r\n";
+                ss<< "\r\n";
+                http_request_and_reply read_crumb{current_job.hostname,current_job.port,ss.str(),true};
+                //std::cerr << read_crumb.http_reply.header<< std::endl;
+                //std::cerr << read_crumb.http_reply.content.str()<< std::endl;
+            }
+#endif
+
+
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
             std::stringstream ss;
             ss << "POST /job/" << current_job.job_name << "/build HTTP/1.1\r\n";
             ss << "Host: "<<current_job.hostname;
@@ -619,51 +661,14 @@ void control_job_thread_fn(int max_tries,
                 ss<<current_job.json_rep_of_params_url_encoded;
             } else ss<< "\r\n";
 
-            auto msg = ss.str();
+            http_request_and_reply read_crumb{current_job.hostname,current_job.port,ss.str()};
 
-
-            addrinfo hints = {0};
-            addrinfo *result, *rp;
-
-            hints.ai_canonname =nullptr;
-            hints.ai_addr = nullptr;
-            hints.ai_next = nullptr;
-            hints.ai_family = AF_UNSPEC;
-            hints.ai_socktype = SOCK_STREAM;
-            hints.ai_flags = AI_NUMERICSERV;
-
-            if (getaddrinfo(current_job.hostname.c_str(),
-                            current_job.port.c_str(),
-                            &hints,
-                            &result) != 0)
-            {
-                std::cerr<<"getaddrinfo() failed\n"<<std::endl; continue;
-            }
-
-            int cfd = -1;
-            for(rp = result; rp != nullptr; rp = rp->ai_next){
-                cfd = socket(rp->ai_family,rp->ai_socktype,rp->ai_protocol);
-                if(cfd==-1)
-                    continue;
-                if(connect(cfd,rp->ai_addr,rp->ai_addrlen) != -1)
-                    break;
-                close(cfd);
-            }
-
-            if(rp == nullptr)
-            {
-                freeaddrinfo(result);
-                std::cerr<<"connect() failed\n"; continue;
-            }
-
-            freeaddrinfo(result);
-
-            if(write(cfd,msg.c_str(),msg.length()) != msg.length()){
-                std::cerr<<"write() failed (msg)\n"; continue;
-            }
-            auto http_reply = read_http_reply(cfd);
+            auto& http_reply = read_crumb.http_reply;
             if (http_reply.reply_code / 100 == 2){
                 plugin_master->queue_event(current_job.ev_done,{sm4ceps_plugin_int::Variant{current_job.job_name}});
+            } else {
+                plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
+                                                                sm4ceps_plugin_int::Variant{"Triggering job failed ("+http_reply.header+")"}});
             }
             //std::this_thread::sleep_for(std::chrono::milliseconds(150 + rand() % 100));
         }
