@@ -23,6 +23,7 @@
 #include <netdb.h>
 #include <stdlib.h>
 #include "rapidjson/rapidjson.h"
+#include "rapidjson/reader.h"
 
 using namespace std::chrono_literals;
 
@@ -315,9 +316,6 @@ static std::string escape_json_string(std::string const & s){
 }
 
 
-
-
-
 static std::pair<bool,std::string> get_virtual_can_attribute_content(std::string attr, std::vector<std::pair<std::string,std::string>> const & http_header){
  for(auto const & v : http_header){
      if (v.first == attr)
@@ -339,12 +337,12 @@ class http_reply_t {
 };
 
 static http_reply_t
-       read_http_reply(int sck,bool debug = false){
+       read_http_reply(int sck,bool debug = true){
 
-
+debug = false;
  http_reply_t r;
- constexpr auto buf_size = 4096;
- char buf[buf_size+1];
+ constexpr auto buf_size = 4;
+ char buf[buf_size+1] = {0};
  std::stringstream stream_buffer;
  std::string eom = "\r\n\r\n";
  std::size_t eom_pos = 0;
@@ -353,6 +351,8 @@ static http_reply_t
  ssize_t readbytes = 0;
  ssize_t buf_pos = 0;
  int content_read = 0;
+ char overwritten_char;
+
 
  for(; (readbytes=recv(sck,buf,buf_size,0)) > 0;){
   buf[readbytes] = 0;
@@ -364,9 +364,9 @@ static http_reply_t
    if (eom_pos == eom.length()){
     req_complete = true;
     if ( buf_pos+1 < readbytes){
-        r.content << buf+(buf_pos+1);
-        content_read = readbytes - buf_pos;
+        content_read = readbytes - (buf_pos+1);
     }
+    overwritten_char = buf[buf_pos+1];
     buf[buf_pos+1] = 0;
     break;
    }
@@ -378,8 +378,11 @@ static http_reply_t
 
  auto buffer = stream_buffer.str();
  int content_length{};
+ bool chunked = false;
 
- if (req_complete) {
+ if (!req_complete) return r;
+
+ {
   std::string first_line;
   size_t line_start = 0;
   for(size_t i = 0; i < buffer.length();++i){
@@ -402,24 +405,15 @@ static http_reply_t
          r.attributes.push_back(std::make_pair(attribute,content));
          if (attribute == "Content-Length")
              content_length = std::atoi(content.c_str());
+         else if (attribute == "Transfer-Encoding" && content == "chunked") chunked = true;
         }
         line_start = i + 2;++i;
     }
   }
   r.header = first_line;
  }
- if (content_length-content_read > 0){
-     auto bytes_left = std::min(r.MAX_CONTENT_SIZE,content_length-content_read);
-     for(; bytes_left ; bytes_left-=readbytes){
-      readbytes=recv(sck,buf,std::min(bytes_left,buf_size),0);
-      buf[readbytes] = 0;
-      if (debug){
-          std::cerr << buf;
-      }
-      r.content << buf;
-     }
- }
- r.content_length = content_length;
+
+
  r.reply_code = -1; //Unknown
  //Get Reply Code
  {
@@ -431,6 +425,101 @@ static http_reply_t
          if (end_rcode != std::string::npos) r.reply_code = std::stoi(r.header.substr(start_rcode,end_rcode - start_rcode));
      }
  }
+
+
+ if (content_read && !chunked){
+     buf[buf_pos+1] = overwritten_char;
+     r.content << buf+(buf_pos+1);
+ }
+
+ if (content_length-content_read > 0){
+
+     auto bytes_left = std::min(r.MAX_CONTENT_SIZE,content_length-content_read);
+     for(; bytes_left ; bytes_left-=readbytes){
+      readbytes=recv(sck,buf,std::min(bytes_left,buf_size),0);
+      buf[readbytes] = 0;
+      if (debug){
+          std::cerr << buf;
+      }
+      r.content << buf;
+     }
+ } else if (chunked){
+    if(content_read){
+      buf[buf_pos+1] = overwritten_char;
+      //std::cerr <<">>"<< (buf+buf_pos+1) << std::endl;
+      auto buf_start = buf_pos + 1;
+      auto buf_len = content_read;
+      for(;;){
+          int bytes_left = 0;
+          {
+              ssize_t chunk_length = 0;
+              auto i = 0;
+              bool rn_found=false;
+              for(;i+1 < buf_len;++i){
+                  rn_found = buf[buf_start+i] == '\r' && buf[buf_start+i+1] == '\n';
+                  if(rn_found) break;
+              }
+              if(!rn_found){
+                  char buffer[128] = {0};
+                  strcpy(buffer,buf+buf_start);
+                  int i = strlen(buffer)-1;
+                  bool r_read = buffer[i] == '\r';
+                  int readbytes=0;
+                  for(;;){
+                      readbytes = recv(sck,buffer+i+1,1,0);
+                      if (readbytes <= 0) return r;
+                      ++i;
+                      if(r_read && buffer[i]=='\n') break;
+                      if(r_read && buffer[i] != '\n') r_read = false;
+                      if(!r_read && buffer[i] == '\r') r_read = true;
+                  }
+                  chunk_length = strtol(buffer,nullptr,16);
+                  if (chunk_length == 0) break;
+                  bytes_left=chunk_length;
+              }else{
+                  chunk_length = strtol(buf+buf_start,nullptr,16);
+                  if (chunk_length == 0) break;
+                  buf_start += i+2;
+                  bytes_left = chunk_length - (buf_len - i - 2 );
+                  if (bytes_left < 0){
+                      char t = buf[buf_start + chunk_length];
+                      buf[buf_start + chunk_length] = 0;
+                      r.content << buf+buf_start;
+                      buf[buf_start + chunk_length] = t;
+                      buf_start += chunk_length + 2;
+                      buf_len -= i+2+chunk_length + 2;
+                      continue;
+                  }
+                  if (chunk_length>0) r.content << buf+buf_start;
+              }
+          }//chunk_start
+          auto readbytes = 0;
+          for(; bytes_left>0 ; bytes_left-=readbytes){
+           readbytes=recv(sck,buf,std::min(bytes_left,buf_size),0);
+           if (readbytes <= 0) break;
+           buf[readbytes] = 0;
+           if (debug){
+               std::cerr << buf;
+           }
+           r.content << buf;
+          }
+          readbytes=recv(sck,buf,2,0);// skip leading \r\n
+          if (readbytes != 2) break;
+          readbytes=recv(sck,buf,buf_size,0);// skip leading \r\n
+
+          if (readbytes > 0){
+            buf[readbytes] = 0;
+            buf_start = 0;
+            buf_len = readbytes;
+          } else  break;
+      }
+    }
+
+ }//chunked
+
+
+ r.content_length = r.content.str().length();
+
  return r;
 }
 
@@ -515,11 +604,201 @@ http_request_and_reply::Resultcode http_request_and_reply::start(std::string con
 
 //Jenkins Monitoring: Builds
 
+class Monitor_jenkins_builds{
+public:
+    struct db{
+        struct entry{
+            std::uint64_t timestamp;
+            std::string key;
+        };
+        std::vector<entry> builds;
+    };
+private:
+ struct Rapidjson_handler {
+     std::vector<db::entry>& builds;
+     Rapidjson_handler(std::vector<db::entry>& b):builds{b}{}
+            bool builds_key_read = false;
+            bool inside_build_list = false;
+            int indent = 0;
+            int obj_depth = 0;
+            db::entry current_entry;
 
+            int param_value_name_ctr=0;
+            bool set_param_name = false;
+            bool set_param_value = false;
+
+            std::string last_param_name;
+            std::string last_param_value;
+
+
+            bool Null(){
+                return true;
+            }
+            //{ std::cout << "Null()" << std::endl; return true; }
+            bool Bool(bool b){
+                return true;
+            }
+            //{ std::cout << "Bool(" << std::boolalpha << b << ")" << std::endl; return true; }
+            bool Int(int i){
+                return true;
+            }
+            //{ std::cout << "Int(" << i << ")" << std::endl; return true; }
+            bool Uint(unsigned u){
+                return true;
+            }
+            //{ std::cout<< "Uint(" << u << ")" << std::endl; return true; }
+            bool Int64(int64_t i){
+                return true;
+            }
+            //{ std::cout << "Int64(" << i << ")" << std::endl; return true; }
+            bool Uint64(uint64_t u){
+                return true;
+            }
+            //{ std::cout << "Uint64(" << u << ")" << std::endl; return true; }
+            bool Double(double d){
+                return true;
+            }
+            //{ std::cout << "Double(" << d << ")" << std::endl; return true; }
+            bool RawNumber(const char* str, rapidjson::SizeType length, bool copy){
+                return true;
+            }
+            //{
+            //    std::cout << "Number(" << str << ", " << length << ", " << std::boolalpha << copy << ")" << std::endl;
+            //    return true;
+            //}
+
+            bool String(const char* str, rapidjson::SizeType length, bool copy){
+                //std::cerr << str << "\n";
+                if (set_param_name){
+                    ++param_value_name_ctr;
+                    last_param_name = str;
+                } else if (set_param_value){
+                    last_param_value = str;
+                    ++param_value_name_ctr;
+                }
+                return true;
+            }
+            //{
+            //    std::cout << "String(" << str << ", " << length << ", " << std::boolalpha << copy << ")" << std::endl;
+            //    return true;
+            // }
+            bool StartObject() {
+                //std::cerr << "so\n";
+                if (inside_build_list) {
+                    param_value_name_ctr = 0;
+                    set_param_name = set_param_value = false;
+                    if(obj_depth == 0){
+                        current_entry = db::entry{};
+                    }
+                    ++obj_depth;
+                }
+                return true;
+            }
+           //{ std::cout << "StartObject()" << std::endl; return true; }
+            bool Key(const char* str, rapidjson::SizeType length, bool copy) {
+                if (strcmp(str,"allBuilds") == 0) {
+                    builds_key_read = true;
+                    //std::cerr << "JJJJJJ" <<std::endl;
+                }
+                if (inside_build_list){
+                    set_param_name = false;
+                    set_param_value = false;
+                    if (strcmp(str,"name")==0){
+                        set_param_name = true;
+                    } else if (strcmp(str,"value")==0){
+                        set_param_value = true;
+                    }
+                }
+                //std::cout << str << std::endl;
+                return true;
+            }
+            //{
+            //    std::cout << "Key(" << str << ", " << length << ", " << std::boolalpha << copy << ")" << std::endl;
+            //    return true;
+            //}
+            bool EndObject(rapidjson::SizeType memberCount) {
+                //std::cerr << "eo\n";
+                if (inside_build_list){
+                    if (param_value_name_ctr == 2){
+                        std::cerr << last_param_name <<"="<< last_param_value << "\n";
+                    }
+                    if (obj_depth == 1){
+                        builds.push_back(current_entry);
+                    }
+                    param_value_name_ctr = 0;
+                    --obj_depth;
+                }
+                return true;
+            }
+            //{ std::cout << "EndObject(" << memberCount << ")" << std::endl; return true; }
+            bool StartArray() {
+                //std::cerr << "FUCKYOU" <<std::endl;
+                if (inside_build_list){
+                    ++indent;
+                }
+                else if (builds_key_read) {
+                    builds_key_read = false;
+                    inside_build_list = true;
+                    indent = 0;
+                }
+                return true;
+            }
+            //{ std::cout << "StartArray()" << std::endl; return true; }
+            bool EndArray(rapidjson::SizeType elementCount) {
+                if (inside_build_list){
+                    if(indent==0) inside_build_list = false;
+                    else --indent;
+                }
+                return true;
+            }
+            //{ std::cout << "EndArray(" << elementCount << ")" << std::endl; return true; }
+        };
+
+private:
+    std::map<std::string, db*> job2db;
+    mutable std::mutex m_;
+public:
+    enum build_status {NOT_FOUND,RUNNING,SUCCESS,FAILURE};
+    build_status get_build_status(job_ext_t job,std::string authorization, std::string jenkins_crumb,int window = 1000){
+        auto it = job2db.find(job.job_name);
+        if (it == job2db.end()){
+            {
+                std::stringstream ss;
+                ss << "GET /job/" << job.job_name << "/api/json?&pretty=true&tree=allBuilds[number,timestamp,actions[parameters[name,value]],result]{0,"<<window<<"} HTTP/1.1\r\n";
+                ss << "Host: "<<job.hostname;
+                if (job.port.length()) ss<<":"<<job.port;
+                ss<< "\r\n";
+                ss<<"User-Agent: RollAut/0.0.1\r\n";
+                ss<<"Accept: */*\r\n";
+                ss<<"Authorization: Basic "<< authorization <<"\r\n";
+                ss<<"Jenkins-Crumb:"<< jenkins_crumb <<"\r\n";
+                ss<< "\r\n";
+                http_request_and_reply read_allbuilds{job.hostname,job.port,ss.str()};
+                {
+                    using namespace rapidjson;
+                    db* d = new db;
+                    Rapidjson_handler handler{d->builds};
+                    Reader reader;
+                    //std::cerr << read_allbuilds.http_reply.content.str() <<std::endl;
+                    std::string temp = read_allbuilds.http_reply.content.str();
+                    StringStream ss(temp.c_str());
+                    reader.Parse(ss, handler);
+                    std::cout << d->builds.size()<<std::endl;
+                }
+                //std::cout << read_allbuilds.http_reply.content.str() << "\n";
+            }
+        }
+        return NOT_FOUND;
+    }
+};
+
+Monitor_jenkins_builds monitor_jenkins_builds;
+
+//
 
 void control_job_thread_fn(int max_tries,
                          std::chrono::milliseconds delta,
-                         std::string host, std::string user,std::string credentials, worker_info_t::queue_t* q){
+                         std::string host, std::string user,std::string credentials, worker_info_t::queue_t* q, Monitor_jenkins_builds* mjb){
 
     std::queue<job_ext_t> jq;
     std::queue<job_ext_t> actions;
@@ -620,28 +899,8 @@ void control_job_thread_fn(int max_tries,
                 }
                 continue;
             }
+
             jq.pop();
-
-#if 1
-            //pos_rollout_automated_002_auto_prepare_and_start_rollout_protocol/api/json?&pretty=true&tree=allBuilds[number,timestamp,actions[parameters[name,value]],result]{0,800}
-            {
-                std::stringstream ss;
-                ss << "GET /job/" << current_job.job_name << "/api/json?&pretty=true&tree=allBuilds[number,timestamp,actions[parameters[name,value]],result]{0,800} HTTP/1.1\r\n";
-                ss << "Host: "<<current_job.hostname;
-                if (current_job.port.length()) ss<<":"<<current_job.port;
-                ss<< "\r\n";
-                ss<<"User-Agent: RollAut/0.0.1\r\n";
-                ss<<"Accept: */*\r\n";
-                ss<<"Authorization: Basic "<< authorization <<"\r\n";
-                ss<<"Jenkins-Crumb:"<< jenkins_crumb <<"\r\n";
-                ss<< "\r\n";
-                http_request_and_reply read_crumb{current_job.hostname,current_job.port,ss.str(),true};
-                //std::cerr << read_crumb.http_reply.header<< std::endl;
-                //std::cerr << read_crumb.http_reply.content.str()<< std::endl;
-            }
-#endif
-
-
 
             std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
@@ -666,10 +925,15 @@ void control_job_thread_fn(int max_tries,
             auto& http_reply = read_crumb.http_reply;
             if (http_reply.reply_code / 100 == 2){
                 plugin_master->queue_event(current_job.ev_done,{sm4ceps_plugin_int::Variant{current_job.job_name}});
+                auto r = mjb->get_build_status(current_job,authorization,jenkins_crumb);
+                std::cerr << "STATUS:" << r << std::endl;
+
+
             } else {
                 plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
                                                                 sm4ceps_plugin_int::Variant{"Triggering job failed ("+http_reply.header+")"}});
             }
+
             //std::this_thread::sleep_for(std::chrono::milliseconds(150 + rand() % 100));
         }
     }
@@ -700,7 +964,7 @@ static void issue_job(job_t job){
     auto it = workers.find(wk);
     if (it == workers.end()){
         auto q = new worker_info_t::queue_t;
-        workers[wk] = worker_info_t{new std::thread{control_job_thread_fn,10,std::chrono::milliseconds{10},job.hostname,"","",q}, q};
+        workers[wk] = worker_info_t{new std::thread{control_job_thread_fn,10,std::chrono::milliseconds{10},job.hostname,"","",q,&monitor_jenkins_builds}, q};
         it = workers.find(wk);
     }
     it->second.job_queue->push(job);
