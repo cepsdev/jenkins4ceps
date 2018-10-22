@@ -7,7 +7,7 @@
 #include <thread>
 #include <condition_variable>
 #include <queue>
-
+#include <unordered_map>
 #include "ceps_all.hh"
 #include "core/include/state_machine_simulation_core_reg_fun.hpp"
 #include "core/include/state_machine_simulation_core_plugin_interface.hpp"
@@ -186,6 +186,7 @@ public:
     std::string ev_timeout;
     std::chrono::milliseconds timeout{0};
     std::vector< std::pair<std::string,sm4ceps_plugin_int::Variant> > params;
+    bool follow_status = false;
 };
 
 class job_ext_t :public job_t{
@@ -199,6 +200,9 @@ public:
     std::string json_rep_of_params;
     std::string json_rep_of_params_url_encoded;
     std::chrono::steady_clock::time_point fetched;
+    std::string key;
+    bool watch = false;
+    int ticks = 100;
 };
 
 struct worker_info_t{
@@ -605,18 +609,79 @@ http_request_and_reply::Resultcode http_request_and_reply::start(std::string con
 //Jenkins Monitoring: Builds
 
 class Monitor_jenkins_builds{
+    std::unordered_map<std::string,int> str2idx;
+    std::unordered_map<int,std::string> idx2str;
 public:
+    bool debug = false;
     struct db{
         struct entry{
+            struct param{
+                int name,value;
+            };
             std::uint64_t timestamp;
+            std::uint64_t build_number;
+            std::string result;
             std::string key;
         };
         std::vector<entry> builds;
+        std::vector<db::entry::param> params;
+        std::vector<int> entryidx2params;
+        std::unordered_map<std::string,int> key2entry;
+        std::string compute_key(std::unordered_map<std::string,int>& str2idx,std::unordered_map<int,std::string>& idx2str,std::vector< std::pair<std::string,sm4ceps_plugin_int::Variant> >& ps){
+            std::string k = "_";
+            if (ps.size()==0) return k;
+            std::vector<std::pair<int,int>> v;
+            for(auto& e:ps){
+                auto it_pn = str2idx.find(e.first);
+                auto idx_pn = 0;
+                if (it_pn == str2idx.end()){
+                    idx_pn = str2idx.size() + 1;
+                    str2idx[e.first] = idx_pn;
+                    idx2str[idx_pn] = e.first;
+                } else idx_pn = it_pn->second;
+                std::string value;
+                if (e.second.what_== sm4ceps_plugin_int::Variant::String)
+                    value = e.second.sv_;
+                else if (e.second.what_ == sm4ceps_plugin_int::Variant::Int)
+                    value = std::to_string(e.second.iv_);
+                else value = std::to_string(e.second.dv_);
+                auto it_pv = str2idx.find(value);
+
+                auto idx_pv = 0;
+                if (it_pv == str2idx.end()){
+                    idx_pv = str2idx.size() + 1;
+                    str2idx[value] = idx_pv;
+                    idx2str[idx_pv] = value;
+                } else idx_pv = it_pv->second;
+                v.push_back({idx_pn,idx_pv});
+            }
+            std::sort(v.begin(),v.end(),[](std::pair<int,int> const & a,std::pair<int,int> const & b){return a.first < b.first; });
+            for(auto const & e: v)
+                k += std::to_string(e.first)+"_";
+            for(auto const & e: v)
+                k += "$" + std::to_string(e.second);
+
+            return k;
+        }
     };
+
 private:
  struct Rapidjson_handler {
      std::vector<db::entry>& builds;
-     Rapidjson_handler(std::vector<db::entry>& b):builds{b}{}
+     std::vector<db::entry::param>& params;
+     std::vector<int>& entryidx2params;
+     std::unordered_map<std::string,int>& str2idx;
+     std::unordered_map<int,std::string>& idx2str;
+
+     Rapidjson_handler(std::vector<db::entry>& b,
+                       std::unordered_map<std::string,int>& str2idx_p,
+                       std::unordered_map<int,std::string>& idx2str_p,
+                       std::vector<db::entry::param>& params_p,
+                       std::vector<int>& entryidx2params_p
+
+                       ):builds{b},str2idx{str2idx_p},idx2str{idx2str_p},params{params_p},entryidx2params{entryidx2params_p}{}
+
+
             bool builds_key_read = false;
             bool inside_build_list = false;
             int indent = 0;
@@ -626,40 +691,66 @@ private:
             int param_value_name_ctr=0;
             bool set_param_name = false;
             bool set_param_value = false;
+            bool timestamp_key_read = false;
+            bool number_key_read = false;
+            bool result_key_read = false;
+            bool key_read = false;
+
 
             std::string last_param_name;
             std::string last_param_value;
 
 
             bool Null(){
+                key_read = false;
+                if(key_read && result_key_read){
+                    current_entry.result = "";
+                }
                 return true;
             }
             //{ std::cout << "Null()" << std::endl; return true; }
             bool Bool(bool b){
+                key_read = false;
                 return true;
             }
             //{ std::cout << "Bool(" << std::boolalpha << b << ")" << std::endl; return true; }
             bool Int(int i){
+
+                key_read = false;
                 return true;
             }
             //{ std::cout << "Int(" << i << ")" << std::endl; return true; }
             bool Uint(unsigned u){
+                if(key_read && number_key_read){
+                    current_entry.build_number = u;
+                }
+                key_read = false;
                 return true;
             }
             //{ std::cout<< "Uint(" << u << ")" << std::endl; return true; }
             bool Int64(int64_t i){
+                key_read = false;
                 return true;
             }
             //{ std::cout << "Int64(" << i << ")" << std::endl; return true; }
             bool Uint64(uint64_t u){
+                if(key_read && timestamp_key_read){
+                    current_entry.timestamp = u;
+                }
+                key_read = false;
                 return true;
             }
             //{ std::cout << "Uint64(" << u << ")" << std::endl; return true; }
             bool Double(double d){
+                key_read = false;
                 return true;
             }
             //{ std::cout << "Double(" << d << ")" << std::endl; return true; }
             bool RawNumber(const char* str, rapidjson::SizeType length, bool copy){
+                if(key_read && timestamp_key_read){
+                    std::cerr << str << std::endl;
+                }
+                key_read = false;
                 return true;
             }
             //{
@@ -676,6 +767,12 @@ private:
                     last_param_value = str;
                     ++param_value_name_ctr;
                 }
+
+                if(key_read && result_key_read){
+                    current_entry.result = str;
+                }
+
+                key_read = false;
                 return true;
             }
             //{
@@ -688,39 +785,55 @@ private:
                     param_value_name_ctr = 0;
                     set_param_name = set_param_value = false;
                     if(obj_depth == 0){
+                        entryidx2params.push_back(params.size());
+                        params.push_back({0,0});
                         current_entry = db::entry{};
                     }
                     ++obj_depth;
                 }
+                key_read = false;
                 return true;
             }
            //{ std::cout << "StartObject()" << std::endl; return true; }
             bool Key(const char* str, rapidjson::SizeType length, bool copy) {
+                key_read = false;
                 if (strcmp(str,"allBuilds") == 0) {
                     builds_key_read = true;
-                    //std::cerr << "JJJJJJ" <<std::endl;
                 }
                 if (inside_build_list){
                     set_param_name = false;
                     set_param_value = false;
                     if (strcmp(str,"name")==0){
-                        set_param_name = true;
+                        set_param_name = key_read= true;
                     } else if (strcmp(str,"value")==0){
-                        set_param_value = true;
+                        set_param_value = key_read = true;
+                    } else if (strcmp(str,"timestamp")==0){
+                        timestamp_key_read = key_read = true;
+                    } else if (strcmp(str,"number")==0){
+                        number_key_read = key_read = true;
+                    } else if (strcmp(str,"result")==0){
+                        result_key_read = key_read = true;
                     }
                 }
-                //std::cout << str << std::endl;
                 return true;
             }
-            //{
-            //    std::cout << "Key(" << str << ", " << length << ", " << std::boolalpha << copy << ")" << std::endl;
-            //    return true;
-            //}
             bool EndObject(rapidjson::SizeType memberCount) {
-                //std::cerr << "eo\n";
                 if (inside_build_list){
                     if (param_value_name_ctr == 2){
-                        std::cerr << last_param_name <<"="<< last_param_value << "\n";
+                        auto it_name = str2idx.find(last_param_name);
+                        auto it_value = str2idx.find(last_param_value);
+                        int pidx,vidx;
+                        if (it_name != str2idx.end()) pidx = it_name->second; else {
+                            pidx = str2idx.size()+1;str2idx[last_param_name] = pidx;
+                            idx2str[pidx] = last_param_name;
+                        }
+                        if (it_value != str2idx.end()) vidx = it_value->second;else {
+                            vidx = str2idx.size()+1;str2idx[last_param_value]=vidx;
+                            idx2str[vidx] = last_param_value;
+                        }
+                        params[params.size()-1].name = pidx;
+                        params[params.size()-1].value = vidx;
+                        params.push_back({0,0});
                     }
                     if (obj_depth == 1){
                         builds.push_back(current_entry);
@@ -730,9 +843,7 @@ private:
                 }
                 return true;
             }
-            //{ std::cout << "EndObject(" << memberCount << ")" << std::endl; return true; }
             bool StartArray() {
-                //std::cerr << "FUCKYOU" <<std::endl;
                 if (inside_build_list){
                     ++indent;
                 }
@@ -743,7 +854,6 @@ private:
                 }
                 return true;
             }
-            //{ std::cout << "StartArray()" << std::endl; return true; }
             bool EndArray(rapidjson::SizeType elementCount) {
                 if (inside_build_list){
                     if(indent==0) inside_build_list = false;
@@ -751,7 +861,6 @@ private:
                 }
                 return true;
             }
-            //{ std::cout << "EndArray(" << elementCount << ")" << std::endl; return true; }
         };
 
 private:
@@ -759,36 +868,84 @@ private:
     mutable std::mutex m_;
 public:
     enum build_status {NOT_FOUND,RUNNING,SUCCESS,FAILURE};
-    build_status get_build_status(job_ext_t job,std::string authorization, std::string jenkins_crumb,int window = 1000){
+    db* build_job_status_db(job_ext_t job,std::string authorization, std::string jenkins_crumb,int window = 1000){
+
+        std::stringstream ss;
+        ss << "GET /job/" << job.job_name << "/api/json?&pretty=true&tree=allBuilds[number,timestamp,actions[parameters[name,value]],result]{0,"<<window<<"} HTTP/1.1\r\n";
+        ss << "Host: "<<job.hostname;
+        if (job.port.length()) ss<<":"<<job.port;
+        ss<< "\r\n";
+        ss<<"User-Agent: RollAut/0.0.1\r\n";
+        ss<<"Accept: */*\r\n";
+        ss<<"Authorization: Basic "<< authorization <<"\r\n";
+        ss<<"Jenkins-Crumb:"<< jenkins_crumb <<"\r\n";
+        ss<< "\r\n";
+        http_request_and_reply read_allbuilds{job.hostname,job.port,ss.str()};
+        {
+            using namespace rapidjson;
+            db* d = new db;
+            Rapidjson_handler handler{d->builds, str2idx, idx2str,d->params,d->entryidx2params};
+            Reader reader;
+            std::string temp = read_allbuilds.http_reply.content.str();
+            StringStream ss(temp.c_str());
+            reader.Parse(ss, handler);
+            for(auto i = 0; i != d->builds.size();++i){
+                std::vector<int> ps;
+                auto params_start = d->entryidx2params[i];
+                for(auto j = params_start;d->params[j].name;++j){
+                    ps.push_back(d->params[j].name);
+                }
+                if(ps.size()) std::sort(ps.begin(),ps.end());
+                std::string k = "_";
+                for(auto l = 0; l != ps.size();++l){
+                    k += std::to_string(ps[l])+"_";
+                }
+                for(auto l = 0; l != ps.size();++l){
+                    for(auto ll = 0; ll != ps.size();++ll){
+                        if (ps[l] == d->params[params_start+ll].name){
+                            k += "$"+std::to_string(d->params[params_start+ll].value);
+                            break;
+                        }
+                    }
+                }
+                auto it = d->key2entry.find(k);
+                if (it == d->key2entry.end()) d->key2entry[k] = i;
+                d->builds[i].key = k;
+            }
+            int ctr = 0;
+            if (debug) for(auto& b : d->builds){
+                std::cout << "-----------\n" << std::endl;
+                std::cout << "build_number:"<< b.build_number << std::endl;
+                std::cout << "timestamp:"<< b.timestamp << std::endl;
+                std::cout << "key:"<< b.key << std::endl;
+                std::cout << "parameters:";
+                auto i = d->entryidx2params[ctr];
+                for(;d->params[i].name;++i){
+                    std::cout << " " << idx2str[d->params[i].name]<<"("<< d->params[i].name <<")"<< "="<< " ("<< d->params[i].value <<")"  <<idx2str[d->params[i].value] << "\n";
+                }
+                std::cout << "\n";
+                ++ctr;
+            }
+            if (debug)std::cout << d->builds.size()<<std::endl;
+            return d;
+        }
+    }
+    std::pair<build_status,db::entry> get_build_info(job_ext_t job,std::string authorization, std::string jenkins_crumb,int window = 1000){
+        db* database = nullptr;
         auto it = job2db.find(job.job_name);
         if (it == job2db.end()){
-            {
-                std::stringstream ss;
-                ss << "GET /job/" << job.job_name << "/api/json?&pretty=true&tree=allBuilds[number,timestamp,actions[parameters[name,value]],result]{0,"<<window<<"} HTTP/1.1\r\n";
-                ss << "Host: "<<job.hostname;
-                if (job.port.length()) ss<<":"<<job.port;
-                ss<< "\r\n";
-                ss<<"User-Agent: RollAut/0.0.1\r\n";
-                ss<<"Accept: */*\r\n";
-                ss<<"Authorization: Basic "<< authorization <<"\r\n";
-                ss<<"Jenkins-Crumb:"<< jenkins_crumb <<"\r\n";
-                ss<< "\r\n";
-                http_request_and_reply read_allbuilds{job.hostname,job.port,ss.str()};
-                {
-                    using namespace rapidjson;
-                    db* d = new db;
-                    Rapidjson_handler handler{d->builds};
-                    Reader reader;
-                    //std::cerr << read_allbuilds.http_reply.content.str() <<std::endl;
-                    std::string temp = read_allbuilds.http_reply.content.str();
-                    StringStream ss(temp.c_str());
-                    reader.Parse(ss, handler);
-                    std::cout << d->builds.size()<<std::endl;
-                }
-                //std::cout << read_allbuilds.http_reply.content.str() << "\n";
-            }
-        }
-        return NOT_FOUND;
+            database = build_job_status_db(job,authorization,jenkins_crumb,window = 1000);
+        } else database = it->second;
+        if (job.key.length() == 0)
+            job.key = database->compute_key(str2idx,idx2str,job.params);
+        auto it_entry = database->key2entry.find(job.key);
+        if(it_entry == database->key2entry.end()) return {NOT_FOUND,{}};
+        auto & e = database->builds[it_entry->second];
+        if (e.result.length()==0)
+          return {RUNNING,e};
+        if (e.result == "SUCCESS")
+            return {SUCCESS,e};
+        return{FAILURE,e};
     }
 };
 
@@ -824,8 +981,6 @@ void control_job_thread_fn(int max_tries,
                             ss<<p.second.dv_;
                         else if(p.second.what_ == sm4ceps_plugin_int::Variant::String)
                             ss<<"\""<<escape_json_string(p.second.sv_)<<"\"";
-
-
                         ss<<"}";
                         first_entry = false;
                     }
@@ -840,6 +995,9 @@ void control_job_thread_fn(int max_tries,
     };
 
     std::map< std::pair<std::string,std::string>,std::string> jenkins_server2_crumb;
+
+
+
     for(;;){
         fetch_new_jobs();
         if(jq.empty()) {
@@ -863,9 +1021,32 @@ void control_job_thread_fn(int max_tries,
 
         for(;jobs_to_process;--jobs_to_process){
             current_job = jq.front();
-
             std::string jenkins_crumb = jenkins_server2_crumb[std::make_pair(current_job.hostname,current_job.port)];//"cb0f4f9bb7847d115e07bb15317f524b";
             std::string authorization = encode_base64(current_job.authorization.data(),current_job.authorization.length());//"dG9tYXM6bEFLdGF0Mzcs";
+
+            if (current_job.watch){
+                if (current_job.ticks <= 0){
+                    auto r = mjb->get_build_info(current_job,authorization,jenkins_crumb);
+                    if (r.first == Monitor_jenkins_builds::SUCCESS){
+                        jq.pop();
+                        plugin_master->queue_event(current_job.ev_done,{sm4ceps_plugin_int::Variant{current_job.job_name}});
+                        continue;
+                    } else if (r.first == Monitor_jenkins_builds::FAILURE){
+                        jq.pop();
+                        plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
+                                                                        sm4ceps_plugin_int::Variant{
+                                                                            "Jenkins:"+r.second.result+" (build #"+std::to_string(r.second.build_number)+
+                                                                            ", timestamp: "+std::to_string(r.second.timestamp)+"))"}
+                                                   });
+                        continue;
+                    }
+                    current_job.ticks = 20;
+                } else --current_job.ticks;
+                jq.pop();
+                jq.push(current_job);
+                continue;
+            }
+
             if (jenkins_crumb.length() == 0){
                 std::stringstream ss;
                 ss << "GET /crumbIssuer/api/xml?xpath=concat(//crumbRequestField,%22:%22,//crumb) HTTP/1.1\r\n";
@@ -920,22 +1101,24 @@ void control_job_thread_fn(int max_tries,
                 ss<<current_job.json_rep_of_params_url_encoded;
             } else ss<< "\r\n";
 
-            http_request_and_reply read_crumb{current_job.hostname,current_job.port,ss.str()};
+            http_request_and_reply trigger_job_request{current_job.hostname,current_job.port,ss.str()};
 
-            auto& http_reply = read_crumb.http_reply;
+            auto& http_reply = trigger_job_request.http_reply;
             if (http_reply.reply_code / 100 == 2){
-                plugin_master->queue_event(current_job.ev_done,{sm4ceps_plugin_int::Variant{current_job.job_name}});
-                auto r = mjb->get_build_status(current_job,authorization,jenkins_crumb);
-                std::cerr << "STATUS:" << r << std::endl;
-
-
+                if(!current_job.follow_status)
+                    plugin_master->queue_event(current_job.ev_done,{sm4ceps_plugin_int::Variant{current_job.job_name}});
+                else{
+                    //auto r = mjb->get_build_info(current_job,authorization,jenkins_crumb);
+                    current_job.watch = true;
+                    current_job.ticks = 0;
+                    jq.push(current_job);
+                }
             } else {
                 plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
                                                                 sm4ceps_plugin_int::Variant{"Triggering job failed ("+http_reply.header+")"}});
-            }
-
-            //std::this_thread::sleep_for(std::chrono::milliseconds(150 + rand() % 100));
-        }
+            }            
+        }//Loop through jobs once
+        std::this_thread::sleep_for(std::chrono::milliseconds(100 + rand() % 100));
     }
 
     for(;!jq.empty();){
@@ -1063,6 +1246,11 @@ static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params
                     }
                     else if (lhs_name == "authorization" && r_->kind() == Ast_node_kind::string_literal){
                         job.authorization = value(as_string_ref(r_));
+                    }
+                    else if (lhs_name == "option" && r_->kind() == Ast_node_kind::string_literal){
+                        if ("follow" == value(as_string_ref(r_))){
+                            job.follow_status = true;
+                        }
                     }
                     else if (lhs_name == "job_name" && r_->kind() == Ast_node_kind::string_literal)
                         job.job_name = value(as_string_ref(r_));
