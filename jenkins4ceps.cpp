@@ -657,7 +657,7 @@ http_request_and_reply::Resultcode http_request_and_reply::start(std::string con
 class Monitor_jenkins_builds{
     std::unordered_map<std::string,int> str2idx;
     std::unordered_map<int,std::string> idx2str;
-    using queue_t = threadsafe_queue<job_t,std::queue<job_t>>;
+    using queue_t = threadsafe_queue<job_ext_t,std::queue<job_ext_t>>;
     queue_t monitor_queue;
     Job_Control* job_control = nullptr;
 public:
@@ -920,25 +920,26 @@ private:
     mutable std::mutex m_;
     struct monitor_info_t{
         std::vector<std::pair<bool,job_ext_t>> jobs;
-        db * database;
+        db * database = nullptr;
     };
     std::map<std::tuple<std::string,std::string,std::string>,monitor_info_t> monitored_jobs;
-
+    void monitoring_thread();
+    std::thread* main_monitoring_thread = nullptr;
+    mutable std::mutex monitor_mtx;
 public:
     enum build_status {NOT_FOUND,RUNNING,SUCCESS,FAILURE};
-    db* build_job_status_db(job_ext_t job,std::string authorization, std::string jenkins_crumb,int window = 1000){
-
+    db* build_job_status_db(std::string job_name,std::string hostname,std::string port,std::string authorization, std::string jenkins_crumb,int window = 1000){
         std::stringstream ss;
-        ss << "GET /job/" << job.job_name << "/api/json?&pretty=true&tree=allBuilds[number,timestamp,actions[parameters[name,value]],result]{0,"<<window<<"} HTTP/1.1\r\n";
-        ss << "Host: "<<job.hostname;
-        if (job.port.length()) ss<<":"<<job.port;
+        ss << "GET /job/" << job_name << "/api/json?&pretty=true&tree=allBuilds[number,timestamp,actions[parameters[name,value]],result]{0,"<<window<<"} HTTP/1.1\r\n";
+        ss << "Host: "<<hostname;
+        if (port.length()) ss<<":"<<port;
         ss<< "\r\n";
         ss<<"User-Agent: RollAut/0.0.1\r\n";
         ss<<"Accept: */*\r\n";
         ss<<"Authorization: Basic "<< authorization <<"\r\n";
         ss<<"Jenkins-Crumb:"<< jenkins_crumb <<"\r\n";
         ss<< "\r\n";
-        http_request_and_reply read_allbuilds{job.hostname,job.port,ss.str()};
+        http_request_and_reply read_allbuilds{hostname,port,ss.str()};
         {
             using namespace rapidjson;
             db* d = new db;
@@ -992,7 +993,7 @@ public:
         db* database = nullptr;
         auto it = job2db.find(job.job_name);
         if (it == job2db.end()){
-            database = build_job_status_db(job,authorization,jenkins_crumb,window = 1000);
+            database = build_job_status_db(job.job_name,job.hostname,job.port,authorization,jenkins_crumb,window = 1000);
         } else database = it->second;
         if (job.key.length() == 0)
             job.key = database->compute_key(str2idx,idx2str,job.params);
@@ -1283,12 +1284,72 @@ extern "C" void init_plugin(IUserdefined_function_registry* smc)
   (plugin_master = smc->get_plugin_interface())->reg_ceps_plugin("jenkins",jenkins_plugin);
 }
 
-//Monitor_jenkins
+//
+//
+/////////////////////////////////////// Monitor_jenkins
 
 void Monitor_jenkins_builds::monitor(job_ext_t job){
+    static auto a = [&](){main_monitoring_thread = new std::thread{&Monitor_jenkins_builds::monitoring_thread,this}; return true;}();
     monitor_queue.push(job);
 }
 
+void Monitor_jenkins_builds::monitoring_thread(){
+    std::queue<job_ext_t> jq;
+    std::queue<job_ext_t> actions;
+
+    auto fetch_new_jobs = [&](){
+            std::lock_guard<std::mutex> lk(monitor_queue.data_mutex());
+            for(;!monitor_queue.data().empty();){
+                job_ext_t e = monitor_queue.data().front();monitor_queue.data().pop();
+                if (e.action.length()==0) jq.push(e);
+                else actions.push(e);
+            }
+    };
+
+    for(;;){
+        fetch_new_jobs();
+        if(jq.empty() && monitored_jobs.empty()){
+            monitor_queue.wait_for_data();
+            continue;
+        }
+        job_ext_t current_job;
+        auto jobs_to_process = jq.size();
+        for(;jobs_to_process;--jobs_to_process){
+            current_job = jq.front();jq.pop();
+            auto & info = monitored_jobs[{current_job.hostname,current_job.port,current_job.job_name}];
+            bool empty_slot_found = false;
+            for(auto& e: info.jobs){
+                if (e.first)continue;
+                empty_slot_found = true;
+                e.second = current_job;
+                break;
+            }
+            if (!empty_slot_found) info.jobs.push_back({true,current_job});
+        }
+        for(auto & monitored_segment : monitored_jobs ){
+            bool no_active_jobs = true;std::string authorization, jenkins_crumb;
+            for(auto & j : monitored_segment.second.jobs) if (j.first) {no_active_jobs = false;authorization = j.second.auth.authorization;jenkins_crumb = j.second.auth.crumb;break;}
+            if(no_active_jobs) continue;
+            bool fetch_build_status = false;
+            auto & database = monitored_segment.second.database;
+            if (database != nullptr) {delete database;database = nullptr;}
+
+            if (database == nullptr){
+                fetch_build_status = true;
+                database =  build_job_status_db(std::get<2>(monitored_segment.first),
+                                                std::get<0>(monitored_segment.first),
+                                                std::get<1>(monitored_segment.first),
+                                                authorization, jenkins_crumb);
+            }
+
+            if (fetch_build_status){
+                std::cerr << database->builds.size() << std::endl;
+
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10000));
+    }
+}
 
 //Jenkins Plugin Implementation
 
