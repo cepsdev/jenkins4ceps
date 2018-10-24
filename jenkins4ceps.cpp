@@ -28,7 +28,6 @@
 using namespace std::chrono_literals;
 
 static const std::string plugin_name = "mms_rollaut_db_check";
-static const auto max_number_of_worker_threads = 1; //per host & user
 
 static void print_usage(std::ostream& os,char * argv[]){
     using namespace std;
@@ -171,8 +170,17 @@ public:
     std::mutex& data_mutex() const {return m_;}
 };
 
+using worker_info_key_t = std::tuple<std::string,std::string,int>;
+
 class job_t {
 public:
+    struct authorization_t{
+        std::string crumb;
+        std::string authorization;
+    };
+
+    worker_info_key_t worker_id; //Each job is associated to a worker thread. In the various processing stages a job jumps between different queues, but the the job's worker thread association
+    //stays the same for ever.
     std::string id;
     std::string command;
     std::string action;
@@ -187,6 +195,11 @@ public:
     std::chrono::milliseconds timeout{0};
     std::vector< std::pair<std::string,sm4ceps_plugin_int::Variant> > params;
     bool follow_status = false;
+    authorization_t auth;
+    bool authorization_complete(){
+        return auth.crumb.length();
+    }
+
 };
 
 class job_ext_t :public job_t{
@@ -197,6 +210,8 @@ public:
     {
         *reinterpret_cast<job_t*>(this) = rhs;
     }
+    job_ext_t(job_ext_t const & rhs) = default;
+
     std::string json_rep_of_params;
     std::string json_rep_of_params_url_encoded;
     std::chrono::steady_clock::time_point fetched;
@@ -215,9 +230,40 @@ struct worker_info_t{
     }
 };
 
-using worker_info_key_t = std::tuple<std::string,std::string,int>;
+struct authenticator_info_t{
+    using queue_t = threadsafe_queue<job_ext_t,std::queue<job_ext_t>>;
+    std::thread * worker_thread = nullptr;
+    queue_t * job_queue = nullptr;
+    authenticator_info_t() = default;
+    authenticator_info_t(std::thread * wt,queue_t * q):worker_thread{wt},job_queue{q}{
+    }
+};
 
-static std::map< worker_info_key_t , worker_info_t > workers;
+
+class Job_Control{
+    virtual bool push_to_worker_queue(job_ext_t const & job) = 0;
+    virtual bool push_to_authenticator_queue(job_ext_t const & job) = 0;
+};
+
+class Jenkinsplugin:public Job_Control {
+    std::map< worker_info_key_t , worker_info_t > workers;
+    std::map< std::pair<std::string,std::string>, authenticator_info_t > authenticators;
+    std::map< std::pair<std::string,std::string>, std::string > host_and_port2crumbs;
+    mutable std::mutex host_and_port2crumbs_mtx;
+
+    int issue_counter = 0;
+    int max_number_of_worker_threads = 1; //per host & user
+    void authenticator_thread(authenticator_info_t::queue_t* job_queue);
+public:
+    void issue_job(job_t job);
+    bool push_to_worker_queue(job_ext_t const & job) override;
+    bool push_to_authenticator_queue(job_ext_t const & job) override;
+};
+
+static Jenkinsplugin jenkinsplugin;
+
+
+
 
 Ism4ceps_plugin_interface* plugin_master;
 std::mutex mysql_driver_mtx;
@@ -611,7 +657,13 @@ http_request_and_reply::Resultcode http_request_and_reply::start(std::string con
 class Monitor_jenkins_builds{
     std::unordered_map<std::string,int> str2idx;
     std::unordered_map<int,std::string> idx2str;
+    using queue_t = threadsafe_queue<job_t,std::queue<job_t>>;
+    queue_t monitor_queue;
+    Job_Control* job_control = nullptr;
 public:
+    void monitor(job_ext_t job);
+    void set_job_control(Job_Control* job_control_) {job_control = job_control_;}
+
     bool debug = false;
     struct db{
         struct entry{
@@ -866,6 +918,12 @@ private:
 private:
     std::map<std::string, db*> job2db;
     mutable std::mutex m_;
+    struct monitor_info_t{
+        std::vector<std::pair<bool,job_ext_t>> jobs;
+        db * database;
+    };
+    std::map<std::tuple<std::string,std::string,std::string>,monitor_info_t> monitored_jobs;
+
 public:
     enum build_status {NOT_FOUND,RUNNING,SUCCESS,FAILURE};
     db* build_job_status_db(job_ext_t job,std::string authorization, std::string jenkins_crumb,int window = 1000){
@@ -951,11 +1009,24 @@ public:
 
 Monitor_jenkins_builds monitor_jenkins_builds;
 
+
+
+
+
+
+
+//
+// Thread to trigger jobs via HTTP POST
 //
 
 void control_job_thread_fn(int max_tries,
                          std::chrono::milliseconds delta,
-                         std::string host, std::string user,std::string credentials, worker_info_t::queue_t* q, Monitor_jenkins_builds* mjb){
+                         std::string host,
+                         std::string user,
+                         std::string credentials,
+                         worker_info_t::queue_t* q,
+                         Monitor_jenkins_builds* mjb,
+                         Jenkinsplugin* jenkinsplugin){
 
     std::queue<job_ext_t> jq;
     std::queue<job_ext_t> actions;
@@ -994,10 +1065,6 @@ void control_job_thread_fn(int max_tries,
             }
     };
 
-    std::map< std::pair<std::string,std::string>,std::string> jenkins_server2_crumb;
-
-
-
     for(;;){
         fetch_new_jobs();
         if(jq.empty()) {
@@ -1021,68 +1088,12 @@ void control_job_thread_fn(int max_tries,
 
         for(;jobs_to_process;--jobs_to_process){
             current_job = jq.front();
-            std::string jenkins_crumb = jenkins_server2_crumb[std::make_pair(current_job.hostname,current_job.port)];//"cb0f4f9bb7847d115e07bb15317f524b";
-            std::string authorization = encode_base64(current_job.authorization.data(),current_job.authorization.length());//"dG9tYXM6bEFLdGF0Mzcs";
-
-            if (current_job.watch){
-                if (current_job.ticks <= 0){
-                    auto r = mjb->get_build_info(current_job,authorization,jenkins_crumb);
-                    if (r.first == Monitor_jenkins_builds::SUCCESS){
-                        jq.pop();
-                        plugin_master->queue_event(current_job.ev_done,{sm4ceps_plugin_int::Variant{current_job.job_name}});
-                        continue;
-                    } else if (r.first == Monitor_jenkins_builds::FAILURE){
-                        jq.pop();
-                        plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
-                                                                        sm4ceps_plugin_int::Variant{
-                                                                            "Jenkins:"+r.second.result+" (build #"+std::to_string(r.second.build_number)+
-                                                                            ", timestamp: "+std::to_string(r.second.timestamp)+"))"}
-                                                   });
-                        continue;
-                    }
-                    current_job.ticks = 20;
-                } else --current_job.ticks;
+            if (!current_job.authorization_complete()){
                 jq.pop();
-                jq.push(current_job);
+                jenkinsplugin->push_to_authenticator_queue(current_job);
                 continue;
             }
-
-            if (jenkins_crumb.length() == 0){
-                std::stringstream ss;
-                ss << "GET /crumbIssuer/api/xml?xpath=concat(//crumbRequestField,%22:%22,//crumb) HTTP/1.1\r\n";
-                ss << "Host: "<<current_job.hostname;
-                if (current_job.port.length()) ss<<":"<<current_job.port;
-                ss<< "\r\n";
-                ss<<"User-Agent: RollAut/0.0.1\r\n";
-                ss<<"Accept: */*\r\n";
-                ss<<"Authorization: Basic "<< authorization <<"\r\n";
-                ss<< "\r\n";
-                http_request_and_reply read_crumb{current_job.hostname,current_job.port,ss.str()};
-                if (read_crumb.last_result != http_request_and_reply::Resultcode::OK){
-                    jq.pop();
-                    plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
-                                                                    sm4ceps_plugin_int::Variant{"Fetching Jenkins Crumb Failed ("+http_request_and_reply::result_str(read_crumb.last_result)+")"}});
-                    continue;
-
-                }
-
-                if ( read_crumb.http_reply.reply_code / 100  == 2 && read_crumb.http_reply.content_length){
-                    auto s = read_crumb.http_reply.content.str();
-                    auto n = s.length();
-                    auto sp = read_crumb.http_reply.content.str().find_last_of(":");
-                    if (sp == std::string::npos) continue;
-                    auto t = read_crumb.http_reply.content.str().substr(sp+1,n-sp-1);
-                    jenkins_server2_crumb[std::make_pair(current_job.hostname,current_job.port)] = t;
-                } else {
-                    jq.pop();
-                    plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
-                                                                    sm4ceps_plugin_int::Variant{"Fetching Jenkins Crumb Failed ("+read_crumb.http_reply.header+")"}});
-                }
-                continue;
-            }
-
             jq.pop();
-
             std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
             std::stringstream ss;
@@ -1092,8 +1103,8 @@ void control_job_thread_fn(int max_tries,
             ss<< "\r\n";
             ss<<"User-Agent: RollAut/0.0.1\r\n";
             ss<<"Accept: */*\r\n";
-            ss<<"Authorization: Basic "<< authorization <<"\r\n";
-            ss<<"Jenkins-Crumb:"<< jenkins_crumb <<"\r\n";
+            ss<<"Authorization: Basic "<< current_job.auth.authorization <<"\r\n";
+            ss<<"Jenkins-Crumb:"<< current_job.auth.crumb <<"\r\n";
 
             if (current_job.json_rep_of_params_url_encoded.length()){
                 ss<<"Content-Length: "<<current_job.json_rep_of_params_url_encoded.length()<<"\r\n";
@@ -1108,10 +1119,7 @@ void control_job_thread_fn(int max_tries,
                 if(!current_job.follow_status)
                     plugin_master->queue_event(current_job.ev_done,{sm4ceps_plugin_int::Variant{current_job.job_name}});
                 else{
-                    //auto r = mjb->get_build_info(current_job,authorization,jenkins_crumb);
-                    current_job.watch = true;
-                    current_job.ticks = 0;
-                    jq.push(current_job);
+                    mjb->monitor(current_job);
                 }
             } else {
                 plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
@@ -1132,26 +1140,10 @@ void control_job_thread_fn(int max_tries,
 
 }
 
-static void issue_job(job_t job){
-    //std::cerr << "issue_job:"<< job.timestamp<<std::endl;
-    static auto issue_counter = 0;
 
-    if (job.action.length()){
-        for(auto const & w : workers){
-            w.second.job_queue->push(job);
-        }
-        return;
-    }
-
-    auto wk = worker_info_key_t{job.hostname, "",issue_counter++ % max_number_of_worker_threads};
-    auto it = workers.find(wk);
-    if (it == workers.end()){
-        auto q = new worker_info_t::queue_t;
-        workers[wk] = worker_info_t{new std::thread{control_job_thread_fn,10,std::chrono::milliseconds{10},job.hostname,"","",q,&monitor_jenkins_builds}, q};
-        it = workers.find(wk);
-    }
-    it->second.job_queue->push(job);
-}
+//
+// cepS plugin part
+//
 
 static void flatten_args(ceps::ast::Nodebase_ptr r, std::vector<ceps::ast::Nodebase_ptr>& v, char op_val = ',')
 {
@@ -1166,14 +1158,9 @@ static void flatten_args(ceps::ast::Nodebase_ptr r, std::vector<ceps::ast::Nodeb
         v.push_back(r);
 }
 
-
-
-
-
-
-
-
 static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params){
+    using namespace ceps::ast;
+
     auto trim = [=](std::string & s) {
         if (s.length() == 0) return;
         auto a = 0;
@@ -1183,11 +1170,13 @@ static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params
         for(;b > a && s[b] == ' ' ;--b);
         if (a != 0 || b != s.length()-1) s = s.substr(a,b-a+1);
     };
-    using namespace ceps::ast;
+
+
+
+
+
     std::vector<ceps::ast::Nodebase_ptr> args;
     if (params != nullptr && params->children().size()) flatten_args(params->children()[0], args, ',');
-    //for(auto e: args) std::cout << *e << " ";
-    //std::cout << std::endl;
 
     job_t job;
     job.ev_fail = "event_jenkins_plugin_failed";
@@ -1284,11 +1273,153 @@ static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params
             }
         }
     }
-    issue_job(job);
+    jenkinsplugin.issue_job(job);
     return nullptr;
 }
 
 extern "C" void init_plugin(IUserdefined_function_registry* smc)
 {
+  monitor_jenkins_builds.set_job_control(&jenkinsplugin);
   (plugin_master = smc->get_plugin_interface())->reg_ceps_plugin("jenkins",jenkins_plugin);
 }
+
+//Monitor_jenkins
+
+void Monitor_jenkins_builds::monitor(job_ext_t job){
+    monitor_queue.push(job);
+}
+
+
+//Jenkins Plugin Implementation
+
+
+
+void Jenkinsplugin::issue_job(job_t job){
+    if (job.action.length()){
+        for(auto const & w : workers){
+            w.second.job_queue->push(job);
+        }
+        return;
+    }
+    auto wk = worker_info_key_t{job.hostname, "",issue_counter++ % max_number_of_worker_threads};
+    auto it = workers.find(wk);
+    if (it == workers.end()){
+        auto q = new worker_info_t::queue_t;
+        workers[wk] = worker_info_t{new std::thread{control_job_thread_fn,
+                                                    10,
+                                                    std::chrono::milliseconds{10},
+                                                    job.hostname,"","",q,&monitor_jenkins_builds,this}, q};
+        it = workers.find(wk);
+    }
+    job.worker_id = wk;
+
+    it->second.job_queue->push(job);
+}
+
+
+bool Jenkinsplugin::push_to_worker_queue(job_ext_t const & job){
+    auto const & wk = job.worker_id;
+    auto it = workers.find(wk);
+    if (it == workers.end()) return false;
+    it->second.job_queue->push(job);
+    return true;
+}
+
+
+bool Jenkinsplugin::push_to_authenticator_queue(job_ext_t const & job) {
+    authenticator_info_t::queue_t* q = nullptr;
+    auto it = authenticators.find({job.hostname,job.port});
+    if (it == authenticators.end()){
+        q = new authenticator_info_t::queue_t{};
+        authenticator_info_t a{new std::thread{&Jenkinsplugin::authenticator_thread,this,q},q };
+        authenticators[{job.hostname,job.port}] = a;
+    } else q = it->second.job_queue;
+    q->push(job);
+    return true;
+}
+
+void Jenkinsplugin::authenticator_thread(authenticator_info_t::queue_t* q){
+    std::queue<job_ext_t> jq;
+    std::queue<job_ext_t> actions;
+
+    auto fetch_new_jobs = [&](){
+            std::lock_guard<std::mutex> lk(q->data_mutex());
+            for(;!q->data().empty();){
+                job_ext_t e = q->data().front();q->data().pop();
+                if (e.action.length()==0) jq.push(e);
+                else actions.push(e);
+            }
+    };
+
+    for(;;){
+        fetch_new_jobs();
+        if(jq.empty()) {
+            q->wait_for_data();
+            continue;
+        }
+        for(;actions.size();){
+            auto a = actions.front();
+            actions.pop();
+            if (a.action == "kill"){
+                auto jobs_to_process = jq.size();
+                for(;jobs_to_process;--jobs_to_process){
+                    auto current_job = jq.front();jq.pop();
+                    if (current_job.job_name != a.job_name || current_job.id != a.id)
+                        jq.push(current_job);
+                }
+            }
+        }
+        job_ext_t current_job;
+        auto jobs_to_process = jq.size();
+
+        for(;jobs_to_process;--jobs_to_process){
+            current_job = jq.front();jq.pop();
+            std::string jenkins_crumb;
+            {
+                std::lock_guard<std::mutex> lk(host_and_port2crumbs_mtx);
+                jenkins_crumb = host_and_port2crumbs[std::make_pair(current_job.hostname,current_job.port)];
+            }
+            std::string authorization = encode_base64(current_job.authorization.data(),current_job.authorization.length());//"dG9tYXM6bEFLdGF0Mzcs";
+
+            if (jenkins_crumb.length() == 0){
+                std::stringstream ss;
+                ss << "GET /crumbIssuer/api/xml?xpath=concat(//crumbRequestField,%22:%22,//crumb) HTTP/1.1\r\n";
+                ss << "Host: "<<current_job.hostname;
+                if (current_job.port.length()) ss<<":"<<current_job.port;
+                ss<< "\r\n";
+                ss<<"User-Agent: RollAut/0.0.1\r\n";
+                ss<<"Accept: */*\r\n";
+                ss<<"Authorization: Basic "<< authorization <<"\r\n";
+                ss<< "\r\n";
+                http_request_and_reply read_crumb{current_job.hostname,current_job.port,ss.str()};
+                if (read_crumb.last_result != http_request_and_reply::Resultcode::OK){
+
+                    plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
+                                                                    sm4ceps_plugin_int::Variant{"Fetching Jenkins Crumb Failed ("+http_request_and_reply::result_str(read_crumb.last_result)+")"}});
+                    continue;
+                }
+
+                if ( read_crumb.http_reply.reply_code / 100  == 2 && read_crumb.http_reply.content_length){
+                    auto s = read_crumb.http_reply.content.str();
+                    auto n = s.length();
+                    auto sp = read_crumb.http_reply.content.str().find_last_of(":");
+                    if (sp == std::string::npos) continue;
+                    auto t = read_crumb.http_reply.content.str().substr(sp+1,n-sp-1);
+                    {
+                        std::lock_guard<std::mutex> lk(host_and_port2crumbs_mtx);
+                        jenkins_crumb=host_and_port2crumbs[std::make_pair(current_job.hostname,current_job.port)]=t;
+                    }
+                } else {
+                    plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
+                                                                    sm4ceps_plugin_int::Variant{"Fetching Jenkins Crumb Failed ("+read_crumb.http_reply.header+")"}});
+                }
+            }
+            if (jenkins_crumb.length() == 0) continue;
+            current_job.auth.crumb = jenkins_crumb;
+            current_job.auth.authorization = authorization;
+            push_to_worker_queue(current_job);
+        }//Loop through jobs once
+    }
+}
+
+
