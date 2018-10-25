@@ -192,6 +192,8 @@ public:
     std::string ev_fail;
     std::string ev_connect_error;
     std::string ev_timeout;
+    std::string ev_job_queued;
+
     std::chrono::milliseconds timeout{0};
     std::vector< std::pair<std::string,sm4ceps_plugin_int::Variant> > params;
     bool follow_status = false;
@@ -214,7 +216,9 @@ public:
 
     std::string json_rep_of_params;
     std::string json_rep_of_params_url_encoded;
-    std::chrono::steady_clock::time_point fetched;
+    std::chrono::system_clock::time_point fetched;
+    std::chrono::system_clock::time_point triggered;
+    long long associated_buildnumber = -1;
     std::string key;
     bool watch = false;
     int ticks = 100;
@@ -241,8 +245,10 @@ struct authenticator_info_t{
 
 
 class Job_Control{
+public:
     virtual bool push_to_worker_queue(job_ext_t const & job) = 0;
     virtual bool push_to_authenticator_queue(job_ext_t const & job) = 0;
+    virtual void ev(std::string ev_name,std::initializer_list<sm4ceps_plugin_int::Variant> vl = {}) = 0;
 };
 
 class Jenkinsplugin:public Job_Control {
@@ -258,6 +264,7 @@ public:
     void issue_job(job_t job);
     bool push_to_worker_queue(job_ext_t const & job) override;
     bool push_to_authenticator_queue(job_ext_t const & job) override;
+    void ev(std::string ev_name,std::initializer_list<sm4ceps_plugin_int::Variant> vl = {}) override;
 };
 
 static Jenkinsplugin jenkinsplugin;
@@ -754,10 +761,11 @@ private:
 
 
             bool Null(){
-                key_read = false;
                 if(key_read && result_key_read){
                     current_entry.result = "";
                 }
+                key_read = false;
+
                 return true;
             }
             //{ std::cout << "Null()" << std::endl; return true; }
@@ -946,6 +954,7 @@ public:
             Rapidjson_handler handler{d->builds, str2idx, idx2str,d->params,d->entryidx2params};
             Reader reader;
             std::string temp = read_allbuilds.http_reply.content.str();
+            //std::cout << temp <<std::endl<<"******************************\n\n\n\n";
             StringStream ss(temp.c_str());
             reader.Parse(ss, handler);
             for(auto i = 0; i != d->builds.size();++i){
@@ -1036,7 +1045,7 @@ void control_job_thread_fn(int max_tries,
             std::lock_guard<std::mutex> lk(q->data_mutex());
             for(;!q->data().empty();){
                 job_ext_t e = q->data().front();
-                e.fetched = std::chrono::steady_clock::now();
+                e.fetched = std::chrono::system_clock::now();
                 if(e.params.size())
                 {
                     std::stringstream ss;
@@ -1095,7 +1104,7 @@ void control_job_thread_fn(int max_tries,
                 continue;
             }
             jq.pop();
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
             std::stringstream ss;
             ss << "POST /job/" << current_job.job_name << "/build HTTP/1.1\r\n";
@@ -1112,6 +1121,7 @@ void control_job_thread_fn(int max_tries,
                 ss<<"Content-Type: application/x-www-form-urlencoded\r\n\r\n";
                 ss<<current_job.json_rep_of_params_url_encoded;
             } else ss<< "\r\n";
+            current_job.triggered = std::chrono::system_clock::now();
 
             http_request_and_reply trigger_job_request{current_job.hostname,current_job.port,ss.str()};
 
@@ -1127,7 +1137,7 @@ void control_job_thread_fn(int max_tries,
                                                                 sm4ceps_plugin_int::Variant{"Triggering job failed ("+http_reply.header+")"}});
             }            
         }//Loop through jobs once
-        std::this_thread::sleep_for(std::chrono::milliseconds(100 + rand() % 100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
     }
 
     for(;!jq.empty();){
@@ -1203,6 +1213,7 @@ static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params
                     else if (lhs_name == "on_success") job.ev_done = rhs_name;
                     else if (lhs_name == "on_connect_error") job.ev_connect_error = rhs_name;
                     else if (lhs_name == "on_timeout") job.ev_timeout = rhs_name;
+                    else if (lhs_name == "on_job_queued") job.ev_job_queued = rhs_name;
                 } else {
                     if (lhs_name == "hostname" && r_->kind() == Ast_node_kind::string_literal)
                         job.hostname = value(as_string_ref(r_));
@@ -1322,32 +1333,86 @@ void Monitor_jenkins_builds::monitoring_thread(){
                 if (e.first)continue;
                 empty_slot_found = true;
                 e.second = current_job;
+                e.first = true;
                 break;
             }
             if (!empty_slot_found) info.jobs.push_back({true,current_job});
         }
         for(auto & monitored_segment : monitored_jobs ){
             bool no_active_jobs = true;std::string authorization, jenkins_crumb;
-            for(auto & j : monitored_segment.second.jobs) if (j.first) {no_active_jobs = false;authorization = j.second.auth.authorization;jenkins_crumb = j.second.auth.crumb;break;}
+            for(auto & j : monitored_segment.second.jobs)
+                if (j.first) {no_active_jobs = false;authorization = j.second.auth.authorization;jenkins_crumb = j.second.auth.crumb;break;}
             if(no_active_jobs) continue;
-            bool fetch_build_status = false;
+
+            auto ttt = 0;
+            for(auto & j : monitored_segment.second.jobs)
+                if (j.first) ++ttt;
+
+            //std::cerr << ttt <<" active jobs\n";
+            //std::cerr << monitored_segment.second.jobs.size() << " entries total\n";
+
+            bool new_data_available = false;
             auto & database = monitored_segment.second.database;
             if (database != nullptr) {delete database;database = nullptr;}
 
             if (database == nullptr){
-                fetch_build_status = true;
+                new_data_available = true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 database =  build_job_status_db(std::get<2>(monitored_segment.first),
                                                 std::get<0>(monitored_segment.first),
                                                 std::get<1>(monitored_segment.first),
                                                 authorization, jenkins_crumb);
             }
 
-            if (fetch_build_status){
-                std::cerr << database->builds.size() << std::endl;
-
-            }
+            if (!new_data_available) continue;
+            for(auto & job : monitored_segment.second.jobs){
+                if (!job.first) continue;
+                if (job.second.key.length() == 0){
+                   job.second.key = database->compute_key(str2idx,idx2str,job.second.params);
+                }
+                ssize_t matching_build_idx = -1;
+                if (job.second.associated_buildnumber < 0){
+                   long long build_number = -1;
+                   long long min_delta = 1;
+                   for(ssize_t i = 0; i < database->builds.size(); ++i){
+                      auto & e = database->builds[i];
+                      if (e.key != job.second.key) continue;
+                      long long t = std::chrono::system_clock::to_time_t(job.second.triggered);
+                      long long delta = t - e.timestamp/1000LL;
+                      if (delta > 0) continue;
+                      if ( delta < min_delta){
+                         build_number = e.build_number;
+                         min_delta = delta;
+                         matching_build_idx = i;
+                      }
+                   }
+                   if (build_number >= 0){
+                      job.second.associated_buildnumber = build_number;
+                      if (job.second.ev_job_queued.length() && job_control) job_control->ev(job.second.ev_job_queued,{sm4ceps_plugin_int::Variant{job.second.job_name},
+                                                                      sm4ceps_plugin_int::Variant{std::to_string(build_number)}});
+                   }
+                } else {
+                    for(ssize_t i = 0; i < database->builds.size(); ++i){
+                        if (database->builds[i].build_number != job.second.associated_buildnumber) continue;
+                        matching_build_idx = i; break;
+                    }
+                }
+                if (matching_build_idx < 0) continue;
+                if (database->builds[matching_build_idx].result.length()==0) continue;
+                //std::cerr << job.second.params[0].second.iv_ << std::endl;
+                job.first = false;
+                if (database->builds[matching_build_idx].result == "SUCCESS")
+                {
+                    if (job_control && job.second.ev_done.length()) job_control->ev(job.second.ev_done,{sm4ceps_plugin_int::Variant{job.second.job_name},
+                                                                sm4ceps_plugin_int::Variant{"SUCCESS (Jenkinsbuild number: "+std::to_string(job.second.associated_buildnumber)+")"}});
+                } else {
+                    if(job_control && job.second.ev_fail.length()) job_control->ev(job.second.ev_fail,{sm4ceps_plugin_int::Variant{job.second.job_name},
+                                                                sm4ceps_plugin_int::Variant{database->builds[matching_build_idx].result+
+                                                                " (Jenkinsbuild number: "+std::to_string(job.second.associated_buildnumber)+")"}});
+                }
+            }//for
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
 }
 
@@ -1377,6 +1442,9 @@ void Jenkinsplugin::issue_job(job_t job){
     it->second.job_queue->push(job);
 }
 
+void Jenkinsplugin::ev(std::string ev_name,std::initializer_list<sm4ceps_plugin_int::Variant> vl){
+    plugin_master->queue_event(ev_name,vl);
+}
 
 bool Jenkinsplugin::push_to_worker_queue(job_ext_t const & job){
     auto const & wk = job.worker_id;
