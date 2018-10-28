@@ -218,6 +218,12 @@ public:
     std::string json_rep_of_params_url_encoded;
     std::chrono::system_clock::time_point fetched;
     std::chrono::system_clock::time_point triggered;
+
+    std::chrono::high_resolution_clock::time_point fetched_hr;
+    std::chrono::high_resolution_clock::time_point triggered_hr;
+    std::chrono::high_resolution_clock::time_point queued_hr;
+
+
     long long associated_buildnumber = -1;
     std::string key;
     bool watch = false;
@@ -936,7 +942,7 @@ private:
     mutable std::mutex monitor_mtx;
 public:
     enum build_status {NOT_FOUND,RUNNING,SUCCESS,FAILURE};
-    db* build_job_status_db(std::string job_name,std::string hostname,std::string port,std::string authorization, std::string jenkins_crumb,int window = 1000){
+    db* build_job_status_db(std::string job_name,std::string hostname,std::string port,std::string authorization, std::string jenkins_crumb,int window = 20000){
         std::stringstream ss;
         ss << "GET /job/" << job_name << "/api/json?&pretty=true&tree=allBuilds[number,timestamp,actions[parameters[name,value]],result]{0,"<<window<<"} HTTP/1.1\r\n";
         ss << "Host: "<<hostname;
@@ -1041,11 +1047,13 @@ void control_job_thread_fn(int max_tries,
     std::queue<job_ext_t> jq;
     std::queue<job_ext_t> actions;
 
+
     auto fetch_new_jobs = [&](){
             std::lock_guard<std::mutex> lk(q->data_mutex());
             for(;!q->data().empty();){
                 job_ext_t e = q->data().front();
                 e.fetched = std::chrono::system_clock::now();
+                e.fetched_hr = std::chrono::high_resolution_clock::now();
                 if(e.params.size())
                 {
                     std::stringstream ss;
@@ -1104,7 +1112,6 @@ void control_job_thread_fn(int max_tries,
                 continue;
             }
             jq.pop();
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
             std::stringstream ss;
             ss << "POST /job/" << current_job.job_name << "/build HTTP/1.1\r\n";
@@ -1122,6 +1129,7 @@ void control_job_thread_fn(int max_tries,
                 ss<<current_job.json_rep_of_params_url_encoded;
             } else ss<< "\r\n";
             current_job.triggered = std::chrono::system_clock::now();
+            current_job.triggered_hr = std::chrono::high_resolution_clock::now();
 
             http_request_and_reply trigger_job_request{current_job.hostname,current_job.port,ss.str()};
 
@@ -1135,9 +1143,10 @@ void control_job_thread_fn(int max_tries,
             } else {
                 plugin_master->queue_event(current_job.ev_fail,{sm4ceps_plugin_int::Variant{current_job.job_name},
                                                                 sm4ceps_plugin_int::Variant{"Triggering job failed ("+http_reply.header+")"}});
-            }            
+            }
+            //std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }//Loop through jobs once
-        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        //std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
 
     for(;!jq.empty();){
@@ -1181,10 +1190,6 @@ static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params
         for(;b > a && s[b] == ' ' ;--b);
         if (a != 0 || b != s.length()-1) s = s.substr(a,b-a+1);
     };
-
-
-
-
 
     std::vector<ceps::ast::Nodebase_ptr> args;
     if (params != nullptr && params->children().size()) flatten_args(params->children()[0], args, ',');
@@ -1388,8 +1393,12 @@ void Monitor_jenkins_builds::monitoring_thread(){
                    }
                    if (build_number >= 0){
                       job.second.associated_buildnumber = build_number;
+                      job.second.queued_hr = std::chrono::high_resolution_clock::now();
+                      auto d = job.second.queued_hr - job.second.triggered_hr;
+                      auto t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
                       if (job.second.ev_job_queued.length() && job_control) job_control->ev(job.second.ev_job_queued,{sm4ceps_plugin_int::Variant{job.second.job_name},
-                                                                      sm4ceps_plugin_int::Variant{std::to_string(build_number)}});
+                                                                      sm4ceps_plugin_int::Variant{std::to_string(build_number)},
+                                                                                                                      sm4ceps_plugin_int::Variant{(((double)t_ms)/1000.000)} });
                    }
                 } else {
                     for(ssize_t i = 0; i < database->builds.size(); ++i){
