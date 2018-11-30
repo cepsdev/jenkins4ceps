@@ -1265,9 +1265,8 @@ static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params
                     else if (lhs_name == "action" && r_->kind() == Ast_node_kind::string_literal)
                         job.action = value(as_string_ref(r_));
                     else if (lhs_name == "parameters"){
-                        if (r_->kind()==Ast_node_kind::nodeset){
-                            auto & v = as_ast_nodeset_ref(r_);
-                            for(auto p : v.children()){
+                        auto read_params = [&](std::vector<ceps::ast::Nodebase_ptr>& v){
+                            for(auto p : v){
                                 if (p->kind() != Ast_node_kind::structdef) continue;
                                 auto & pp = as_struct_ref(p);
                                 if(name(pp) != "param") continue;
@@ -1284,12 +1283,26 @@ static ceps::ast::Nodebase_ptr jenkins_plugin(ceps::ast::Call_parameters* params
                                 else if (param["value"].nodes()[0]->kind() == Ast_node_kind::float_literal) param_value = value(as_double_ref(param["value"].nodes()[0]));
                                 job.params.push_back({param_name,param_value});
                             }
+                        };
+                        if (r_->kind()==Ast_node_kind::nodeset){
+                            auto & v = as_ast_nodeset_ref(r_);
+                            read_params(v.children());
+                        } else if (r_->kind()==Ast_node_kind::structdef){
+                            auto& v = as_struct_ref(r_);
+                            read_params(v.children());
                         }
                     }
                 }
             }
         }
     }
+#if 0
+    std::cerr << job.hostname << std::endl;
+    std::cerr << job.port << std::endl;
+    std::cerr << job.authorization << std::endl;
+    std::cerr << job.job_name << std::endl;
+    std::cerr << job.params.size() << std::endl;
+#endif
     jenkinsplugin.issue_job(job);
     return nullptr;
 }
