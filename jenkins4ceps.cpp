@@ -172,6 +172,27 @@ public:
 
 using worker_info_key_t = std::tuple<std::string,std::string,int>;
 
+auto normalize_jenkins_job_name(std::string const & jn)->std::string{
+ if(jn.find_first_of('/') == std::string::npos)
+     return jn;
+ std::string r;
+ ssize_t i = 0;
+ if (jn[0] == '/') ++i; //INVARIANT: jn not empty because it contains at least one '/'
+ for(;jn.length()>i;++i)
+ {
+     if (jn[i] == '/')
+        r+= "/job/";
+     else{
+         char buffer[2] = {0};
+         buffer[0] = jn[i];
+         r += buffer;
+     }
+ }
+ return r;
+}
+
+
+
 class job_t {
 public:
     struct authorization_t{
@@ -944,7 +965,7 @@ public:
     enum build_status {NOT_FOUND,RUNNING,SUCCESS,FAILURE};
     db* build_job_status_db(std::string job_name,std::string hostname,std::string port,std::string authorization, std::string jenkins_crumb,int window = 20000){
         std::stringstream ss;
-        ss << "GET /job/" << job_name << "/api/json?&pretty=true&tree=allBuilds[number,timestamp,actions[parameters[name,value]],result]{0,"<<window<<"} HTTP/1.1\r\n";
+        ss << "GET /job/" << normalize_jenkins_job_name(job_name) << "/api/json?&pretty=true&tree=allBuilds[number,timestamp,actions[parameters[name,value]],result]{0,"<<window<<"} HTTP/1.1\r\n";
         ss << "Host: "<<hostname;
         if (port.length()) ss<<":"<<port;
         ss<< "\r\n";
@@ -960,7 +981,6 @@ public:
             Rapidjson_handler handler{d->builds, str2idx, idx2str,d->params,d->entryidx2params};
             Reader reader;
             std::string temp = read_allbuilds.http_reply.content.str();
-            //std::cout << temp <<std::endl<<"******************************\n\n\n\n";
             StringStream ss(temp.c_str());
             reader.Parse(ss, handler);
             for(auto i = 0; i != d->builds.size();++i){
@@ -1114,7 +1134,7 @@ void control_job_thread_fn(int max_tries,
             jq.pop();
 
             std::stringstream ss;
-            ss << "POST /job/" << current_job.job_name << "/build HTTP/1.1\r\n";
+            ss << "POST /job/" << normalize_jenkins_job_name(current_job.job_name) << "/build HTTP/1.1\r\n";
             ss << "Host: "<<current_job.hostname;
             if (current_job.port.length()) ss<<":"<<current_job.port;
             ss<< "\r\n";
